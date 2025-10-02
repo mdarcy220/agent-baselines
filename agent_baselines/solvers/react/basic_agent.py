@@ -3,6 +3,7 @@ inspect_ai.solver.basic_agent (MIT License), but with some small prompt changes
 and some changes to the way tool calling works (added a 'text' tool call format
 that circumvents the built-in tool calling mechanism)."""
 
+import asyncio
 import json
 import re
 import uuid
@@ -11,6 +12,7 @@ from typing import Literal
 
 from astabench.tools import ToolsetConfig
 from astabench.tools.submission import get_submission_manager, submit_tool
+from astabench.util.sandbox.sandbox_jupyter import RuntimeInternalTimeout
 from astabench.util.state import merge_tools_with_state
 from inspect_ai.model import (
     CachePolicy,
@@ -18,6 +20,7 @@ from inspect_ai.model import (
     ChatMessageTool,
     ChatMessageUser,
     Model,
+    ModelOutput,
     call_tools,
     get_model,
 )
@@ -130,6 +133,24 @@ def tools_to_prompt_text(tools: list[Tool]) -> str:
     return s
 
 
+async def generate_with_timeout(
+    model: Model,
+    *args,
+    timeout: int | None = None,
+    **kwargs,
+) -> ModelOutput:
+    """Just calls model.generate, but applies the given timeout and raises
+    a RuntimeError if it is exceeded.  Theoretically InspectAI should already
+    apply the timeout from the model.config.timeout, but this seems to not
+    happen for some models."""
+
+    try:
+        # `timeout` can be `None`; `wait_for` waits forever in that case
+        return await asyncio.wait_for(model.generate(*args, **kwargs), timeout)
+    except TimeoutError as e:
+        raise RuntimeInternalTimeout("model.generate timed out") from e
+
+
 @solver
 def basic_agent(
     *,
@@ -144,6 +165,7 @@ def basic_agent(
     submit_description: str = DEFAULT_SUBMIT_DESCRIPTION,
     tool_call_format: Literal["text", "native"] = "native",
     model_override: str | Model | None = None,
+    llm_call_timeout: int | None = None,
 ) -> Solver:
     """Basic ReAct agent.
 
@@ -238,10 +260,12 @@ def basic_agent(
                             )
                         )
                     # generate output and append assistant message
-                    state.output = await get_model(model_override).generate(
+                    state.output = await generate_with_timeout(
+                        get_model(model_override),
                         input=state.messages,
                         cache=cache,
                         tools=(state.tools if tool_call_format == "native" else []),
+                        timeout=llm_call_timeout,
                     )
 
                     if tool_call_format == "text":
@@ -324,6 +348,7 @@ def basic_agent(
 def instantiated_basic_agent(
     max_steps: int = 10,
     model_override: str | Model | None = None,
+    llm_call_timeout: int | None = None,
     **tool_options,
 ):
     """Basic ReAct agent with configurable tools.
@@ -354,4 +379,5 @@ def instantiated_basic_agent(
         max_steps=max_steps,
         add_submit_tool=not config.with_editor_submit,
         model_override=model_override,
+        llm_call_timeout=llm_call_timeout,
     )
