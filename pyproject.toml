@@ -24,6 +24,9 @@ dev = [
     "pandas-stubs",
     "httpx-sse>=0.4.2",
 ]
+dspy = [
+    "dspy-ai>=2.5.0",
+]
 azure = [
     "azure-ai-inference"
 ]
