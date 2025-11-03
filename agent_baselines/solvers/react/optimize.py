@@ -19,41 +19,40 @@ from pathlib import Path
 import dspy
 from astabench.evals.sqa import sqa_dev
 from astabench.tools import ToolsetConfig
-from inspect_ai import eval as inspect_eval
 
 from agent_baselines.solvers.react.basic_agent import (
     DEFAULT_SUBMIT_NAME,
 )
 from agent_baselines.solvers.react.dspy_agent import (
     DSPyReActPrompts,
-    create_agent_with_dspy_prompts,
 )
+from agent_baselines.solvers.react.parallel_eval import eval_in_subprocess
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
 # Default task description for SQA
 SQA_TASK_DESCRIPTION = """Generate a report answering research questions with inline citations.
 The agent should use search tools to find relevant papers, read them, and synthesize a well-cited response."""
 
 
-def create_metric_function(model_name: str, base_task, tool_config: ToolsetConfig):
+def create_metric_function(model_name: str, tool_config: ToolsetConfig):
     """Create a metric function that evaluates agent performance on SQA.
 
     This metric function:
     1. Takes a DSPy prediction (containing candidate prompts)
-    2. Creates a solver with those prompts
-    3. Runs inspect_ai.eval() on the specific sample
-    4. Extracts and returns the global_avg score
+    2. Runs inspect_ai.eval() in a subprocess (for parallelization)
+    3. Returns the global_avg score
 
     Args:
         model_name: Name of the model to use for the agent
-        base_task: The sqa_dev task (used to get scorer, etc.)
         tool_config: Tool configuration to use
 
     Returns:
         A function that takes (example, prediction, trace) and returns a score
     """
+    # Convert tool config to dict for subprocess serialization
+    tool_config_dict = tool_config.model_dump()
 
     def metric(example, prediction, trace=None) -> float:
         """DSPy metric function.
@@ -71,62 +70,29 @@ def create_metric_function(model_name: str, base_task, tool_config: ToolsetConfi
         continue_message = prediction.continue_message
         sample_id = example.sample_id
 
-        logger.info(f"Evaluating sample {sample_id} with candidate prompts")
+        logger.info(f"Evaluating sample {sample_id} in subprocess")
 
-        # Create solver with candidate prompts
-        agent_solver = create_agent_with_dspy_prompts(
-            system_message_text=system_message,
-            continue_message_text=continue_message,
-            max_steps=10,
-            tools=tool_config.create_tools(),
-            add_submit_tool=not tool_config.with_editor_submit,
-        )
+        # Run eval in subprocess (enables parallelization)
+        try:
+            score_value = eval_in_subprocess(
+                sample_id=sample_id,
+                system_message=system_message,
+                continue_message=continue_message,
+                model_name=model_name,
+                task_name="sqa_dev",
+                tool_config_dict=tool_config_dict,
+                timeout=600,  # 10 minute timeout per sample
+            )
 
-        # Run eval on just this sample
-        # Pass solver directly to eval() - it overrides the task's solver
-        logs = inspect_eval(
-            tasks=[base_task],
-            model=model_name,
-            solver=agent_solver,  # Override the task's solver
-            sample_id=sample_id,  # Only evaluate this specific sample
-            log_dir=".dspy_cache",
-            log_level="warning",
-            display="plain",
-        )
+            logger.info(
+                f"Sample {sample_id} score: {score_value:.4f} "
+                f"(system_msg: {system_message[:50]}...)"
+            )
+            return score_value
 
-        # Extract score from the specific sample
-        # Fail loudly per CLAUDE.md - use assertions instead of silent 0.0 returns
-        assert logs and len(logs) > 0, f"No logs returned for sample {sample_id}"
-
-        eval_log = logs[0]
-
-        assert (
-            eval_log.samples and len(eval_log.samples) > 0
-        ), f"No samples in eval log for {sample_id}"
-
-        sample = eval_log.samples[0]
-
-        assert sample.scores, f"No scores for sample {sample_id}"
-
-        # Extract global_avg from the sample's scores
-        # sample.scores is dict[str, Score]
-        for scorer_name, score in sample.scores.items():
-            if isinstance(score.value, dict) and "global_avg" in score.value:
-                score_value = float(score.value["global_avg"])
-                logger.info(
-                    f"Sample {sample_id} score: {score_value:.4f} "
-                    f"(scorer: {scorer_name}, system_msg: {system_message[:50]}...)"
-                )
-                return score_value
-
-        # If we get here, the score format is not what we expected - fail loudly
-        score_info = {
-            name: type(score.value).__name__ for name, score in sample.scores.items()
-        }
-        raise ValueError(
-            f"No global_avg found in scores for sample {sample_id}. "
-            f"Available scores: {score_info}"
-        )
+        except Exception as e:
+            logger.error(f"Failed to evaluate sample {sample_id}: {e}")
+            raise
 
     return metric
 
@@ -216,15 +182,14 @@ def optimize_prompts(
     # Set up DSPy language model for generating candidate prompts
     optimizer_model = optimizer_model or model_name
     lm = dspy.LM(model=optimizer_model)
-    # Configure DSPy with num_threads=1 to disable parallelization
-    # (inspect_ai.eval doesn't support concurrent calls)
-    dspy.settings.configure(lm=lm, num_threads=1)
+    # Allow DSPy to use default parallelization (we use subprocesses for eval isolation)
+    dspy.settings.configure(lm=lm)
 
     logger.info(f"Agent model: {model_name}")
     logger.info(f"Optimizer model: {optimizer_model}")
     logger.info("Loading data...")
     logger.info(
-        "Note: Running evaluations sequentially (inspect_ai doesn't support parallelization)"
+        "Running evaluations in parallel using subprocess isolation (bypasses inspect_ai limitation)"
     )
 
     # Load base task
@@ -253,9 +218,9 @@ def optimize_prompts(
     # Create the DSPy module
     react_prompts = DSPyReActPrompts()
 
-    # Create metric function that uses inspect_ai
-    logger.info("Creating metric function...")
-    metric = create_metric_function(model_name, base_task, tool_config)
+    # Create metric function that uses subprocess-based eval
+    logger.info("Creating metric function (subprocess-based for parallelization)...")
+    metric = create_metric_function(model_name, tool_config)
 
     # Set up optimizer based on type
     logger.info(f"Setting up {optimizer_type} optimizer...")
@@ -390,6 +355,8 @@ def optimize_prompts(
     print(
         f"\n  (The optimized agent will automatically load prompts from {output_path})"
     )
+
+    print(f"\n✓ Parallel optimization completed successfully using subprocess isolation!")
     print()
 
     return optimized_prompts
