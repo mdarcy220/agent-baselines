@@ -15,9 +15,11 @@ Key architecture:
 import json
 import logging
 import os
+import textwrap
 from pathlib import Path
 
 import dspy
+import numpy as np
 
 from agent_baselines.solvers.react.basic_agent import (
     DEFAULT_SUBMIT_NAME,
@@ -34,9 +36,42 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
-# Default task description for SQA
-SQA_TASK_DESCRIPTION = """Generate a report answering research questions with inline citations.
-The agent should use search tools to find relevant papers, read them, and synthesize a well-cited response."""
+
+def log_block(
+    text: str,
+    char: str = "=",
+    width: int = 80,
+    trailing_separator: bool = True,
+):
+    """Log a formatted block with leading and optional trailing separators.
+
+    Args:
+        text: Text to log (multiline text will be dedented automatically)
+        char: Character for separator lines (default: "=")
+        width: Width of separator lines (default: 80)
+        trailing_separator: Add trailing separator after text (default: True)
+    """
+    separator = char * width
+
+    # Log leading separator
+    logger.info(separator)
+
+    # Dedent and log text (handling multiline blocks)
+    dedented_text = textwrap.dedent(text).strip()
+    for line in dedented_text.split("\n"):
+        logger.info(line)
+
+    # Log trailing separator if requested
+    if trailing_separator:
+        logger.info(separator)
+
+
+# Generic task description for generating final optimized prompts (multi-task optimization)
+GENERIC_TASK_DESCRIPTION = """You will be given a task to complete. Use the available tools to help you solve the task, doing reasoning before each action to explain your approach."""
+
+# Target number of samples per task when calculating adaptive minibatch size.
+# This ensures adequate coverage across all task types during MIPRO optimization.
+SAMPLES_PER_TASK_FOR_MINIBATCH = 5
 
 
 def load_tasks_from_config(
@@ -115,7 +150,12 @@ def load_tasks_from_config(
     return suite_config.get_tasks(split)
 
 
-def create_metric_function(model_names: list[str], optimizer_type: str = "mipro"):
+def create_metric_function(
+    model_names: list[str],
+    optimizer_type: str = "mipro",
+    eval_timeout: int = 600,
+    agent_kwargs: dict | None = None,
+):
     """Create a metric function that evaluates agent performance across tasks and models.
 
     This metric function:
@@ -127,12 +167,16 @@ def create_metric_function(model_names: list[str], optimizer_type: str = "mipro"
     Args:
         model_names: List of model names to evaluate on (scores will be averaged)
         optimizer_type: Type of optimizer ("mipro" or "gepa") for feedback support
+        eval_timeout: Timeout in seconds for each sample evaluation
+        agent_kwargs: Additional keyword arguments to pass to the agent solver (e.g., {"max_steps": 10})
 
     Returns:
         A function that takes (example, prediction, trace, pred_name, pred_trace) and returns:
         - float score for MIPROv2
         - dict with {"score": float, "feedback": str} for GEPA
     """
+    if agent_kwargs is None:
+        agent_kwargs = {}
 
     def metric(example, prediction, trace=None, pred_name=None, pred_trace=None):
         """DSPy metric function for multi-task, multi-model evaluation.
@@ -167,14 +211,16 @@ def create_metric_function(model_names: list[str], optimizer_type: str = "mipro"
         std_log_file = f"{log_dir}/{sample_id}_{timestamp}.log"
 
         # Print clearer DSPy-level logging
-        logger.info(f"\n{'='*80}")
-        logger.info(f"DSPy Metric Evaluation:")
-        logger.info(f"  Sample: {sample_id}")
-        logger.info(f"  Task: {task_name} ({task_path})")
-        logger.info(f"  Models: {', '.join(model_names)}")
-        logger.info(f"  Candidate prompts being tested...")
-        logger.info(f"  (Detailed eval output → {std_log_file})")
-        logger.info(f"{'='*80}\n")
+        log_block(
+            f"""
+            DSPy Metric Evaluation:
+              Sample: {sample_id}
+              Task: {task_name} ({task_path})
+              Models: {', '.join(model_names)}
+              Candidate prompts being tested...
+              (Detailed eval output → {std_log_file})
+            """,
+        )
 
         # Run eval in subprocess (enables parallelization)
         try:
@@ -185,8 +231,9 @@ def create_metric_function(model_names: list[str], optimizer_type: str = "mipro"
                 model_names=model_names,
                 task_path=task_path,
                 primary_metric=primary_metric,
-                timeout=600,  # 10 minute timeout per sample
+                timeout=eval_timeout,
                 std_log_file=std_log_file,
+                agent_kwargs=agent_kwargs,
             )
 
             # Print result
@@ -325,6 +372,9 @@ def optimize_prompts(
     config_path: str | None = None,
     task_split: str | None = "validation",
     tasks: list[str] | None = None,
+    eval_timeout: int = 600,
+    optimizer_temperature: float = 1.0,
+    agent_kwargs: dict | None = None,
 ):
     """Run DSPy optimization on ReAct agent prompts across multiple tasks and models.
 
@@ -335,14 +385,20 @@ def optimize_prompts(
         samples_per_task: Maximum number of samples to use per task
         train_ratio: Ratio of data to use for training
         num_candidates: Number of candidate prompts (for GEPA/MIPRO)
-        num_trials: Number of trials for MIPRO (defaults to ~3.6 * num_candidates)
+        num_trials: Number of trials for MIPRO (defaults to DSPy's formula: max(2*num_vars*log2(N), 1.5*N))
         max_bootstrapped_demos: Max bootstrapped demonstrations
         max_labeled_demos: Max labeled demonstrations
         output_file: Where to save the optimized prompts
         config_path: Path to astabench config (default: uses astabench default)
         task_split: Which split to use from config (default: "validation"). Mutually exclusive with tasks.
         tasks: Specific task paths to use (e.g., ["astabench/sqa_dev"]). Mutually exclusive with task_split.
+        eval_timeout: Timeout in seconds for each sample evaluation
+        optimizer_temperature: Temperature for DSPy optimizer prompt generation
+        agent_kwargs: Additional keyword arguments to pass to the agent solver (e.g., {"max_steps": 10}).
+                     Defaults to {"max_steps": 10} for backward compatibility.
     """
+    if agent_kwargs is None:
+        agent_kwargs = {"max_steps": 10}
     # Convert single model to list
     if isinstance(models, str):
         models = [models]
@@ -392,7 +448,9 @@ def optimize_prompts(
 
     # Create metric function that uses subprocess-based eval
     logger.info("Creating metric function (subprocess-based for parallelization)...")
-    metric = create_metric_function(models)
+    metric = create_metric_function(
+        models, eval_timeout=eval_timeout, agent_kwargs=agent_kwargs
+    )
 
     # Set up optimizer based on type
     logger.info(f"Setting up {optimizer_type} optimizer...")
@@ -408,7 +466,7 @@ def optimize_prompts(
                 metric=metric,
                 breadth=num_candidates,
                 depth=3,
-                init_temperature=1.0,
+                init_temperature=optimizer_temperature,
             )
             optimizer_name = "GEPA"
         except ImportError:
@@ -425,13 +483,23 @@ def optimize_prompts(
             metric=metric,
             auto=None,  # Enable manual mode
             num_candidates=num_candidates,
-            init_temperature=1.0,
+            init_temperature=optimizer_temperature,
         )
         optimizer_name = "MIPROv2"
         # Calculate num_trials for compile() call (MIPRO needs it there, not in __init__)
-        mipro_num_trials = num_trials or int(num_candidates * 3.6)
+        # Use DSPy's official formula: max(2 * num_vars * log₂(N), 1.5 * N)
+        # where num_vars = num_predictors * 2 for few-shot mode (bootstrap demos)
+        # Source: DSPy MIPROv2 documentation
+        if num_trials is None:
+            num_predictors = len(react_prompts.predictors())
+            num_vars = num_predictors * 2  # Assuming few-shot mode (bootstrap demos)
+            mipro_num_trials = int(
+                max(2 * num_vars * np.log2(num_candidates), 1.5 * num_candidates)
+            )
+        else:
+            mipro_num_trials = num_trials
         logger.info(
-            f"Using manual mode with num_candidates={num_candidates}, num_trials={mipro_num_trials}"
+            f"Using manual mode with num_candidates={num_candidates}, num_trials={mipro_num_trials} (DSPy formula)"
         )
 
     elif optimizer_type == "bootstrap":
@@ -449,12 +517,15 @@ def optimize_prompts(
     logger.info(f"Using {optimizer_name} optimizer")
 
     # Run optimization
-    logger.info("\n" + "=" * 80)
-    logger.info("STARTING DSPY OPTIMIZATION")
-    logger.info("=" * 80)
-    logger.info(f"\nOptimizer: {optimizer_name}")
-    logger.info(f"Training samples: {len(train_examples)}")
-    logger.info(f"Models being optimized for: {', '.join(models)}")
+    log_block(
+        f"""
+        STARTING DSPY OPTIMIZATION
+
+        Optimizer: {optimizer_name}
+        Training samples: {len(train_examples)}
+        Models being optimized for: {', '.join(models)}
+    """,
+    )
 
     # Prepare compile() arguments based on optimizer type
     compile_kwargs = {
@@ -467,14 +538,29 @@ def optimize_prompts(
     if optimizer_type == "mipro":
         compile_kwargs["num_trials"] = mipro_num_trials
         # Adaptive minibatch sizing for multi-task optimization
-        # Ensure adequate coverage across all task types (aim for ~5 examples per task)
+        # Ensure adequate coverage across all task types
+        # Must not exceed validation set size (DSPy internal requirement)
         num_tasks = len(task_configs)
-        minibatch_size = min(len(train_examples), num_tasks * 5)
+        desired_minibatch = num_tasks * SAMPLES_PER_TASK_FOR_MINIBATCH
+        minibatch_size = min(len(train_examples), len(val_examples), desired_minibatch)
         compile_kwargs["minibatch_size"] = minibatch_size
         compile_kwargs["minibatch"] = True
         logger.info(
-            f"Minibatch size: {minibatch_size} (adaptive: {num_tasks} tasks × 5)"
+            f"Minibatch size: {minibatch_size} "
+            f"(adaptive: min(train={len(train_examples)}, val={len(val_examples)}, "
+            f"{num_tasks} tasks × {SAMPLES_PER_TASK_FOR_MINIBATCH}))"
         )
+
+        # Warn if validation set size is limiting the adaptive sizing
+        if len(val_examples) < desired_minibatch and len(val_examples) < len(
+            train_examples
+        ):
+            logger.warning(
+                f"Validation set size ({len(val_examples)}) is limiting minibatch size. "
+                f"Desired {desired_minibatch} samples "
+                f"({num_tasks} tasks × {SAMPLES_PER_TASK_FOR_MINIBATCH}) for multi-task coverage. "
+                f"Consider increasing --samples-per-task or adjusting train_ratio."
+            )
         logger.info(f"Number of trials: {mipro_num_trials}")
         logger.info(
             f"\nEach trial will evaluate {minibatch_size} sample(s) on {len(models)} model(s)"
@@ -486,18 +572,17 @@ def optimize_prompts(
     logger.info("\nDSPy will now generate and test candidate prompts...")
     logger.info("Watch for 'DSPy Metric Evaluation' blocks below to see progress.")
     logger.info("Detailed per-sample logs are being written to: .dspy_cache/eval_logs/")
-    logger.info("=" * 80 + "\n")
 
     optimized_module = optimizer.compile(react_prompts, **compile_kwargs)
 
-    logger.info("\n" + "=" * 80)
     logger.info("OPTIMIZATION COMPLETE!")
-    logger.info("=" * 80 + "\n")
 
     # Generate optimized prompts
+    # Use generic task description since we want universal prompts for multi-task optimization
     logger.info("\nGenerating optimized prompts...")
     optimized_prediction = optimized_module(
-        task_description=SQA_TASK_DESCRIPTION, submit_function_name=DEFAULT_SUBMIT_NAME
+        task_description=GENERIC_TASK_DESCRIPTION,
+        submit_function_name=DEFAULT_SUBMIT_NAME,
     )
 
     # Collect task information for metadata
@@ -526,18 +611,11 @@ def optimize_prompts(
     with open(output_path, "w") as f:
         json.dump(optimized_prompts, f, indent=2)
 
-    # Print results to stdout (logger may be suppressed)
-    logger.info(f"\n{'='*60}")
-    logger.info("✓ Multi-Task, Multi-Model Optimization Complete!")
-    logger.info(f"{'='*60}")
-    logger.info(f"\n📁 Optimized prompts saved to: {output_path}")
-    logger.info(f"\n📝 Optimized System Message:")
-    logger.info("-" * 60)
-    logger.info(optimized_prompts["system_message"])
-    logger.info(f"\n📝 Optimized Continue Message:")
-    logger.info("-" * 60)
-    logger.info(optimized_prompts["continue_message"])
-    logger.info(f"\n{'='*60}")
+    logger.info("📁 Optimized prompts saved to: %s", output_path)
+    logger.info("📝 Optimized System Message: %s", optimized_prompts["system_message"])
+    logger.info(
+        "📝 Optimized Continue Message: %s", optimized_prompts["continue_message"]
+    )
 
     # Evaluate on validation set
     if val_examples:
@@ -605,7 +683,7 @@ if __name__ == "__main__":
         "--train-ratio",
         type=float,
         default=0.8,
-        help="Ratio of samples to use for training",
+        help="Ratio of samples to use for training vs validation (default: 0.8 = 80/20 split)",
     )
     parser.add_argument(
         "--num-candidates",
@@ -617,7 +695,19 @@ if __name__ == "__main__":
         "--num-trials",
         type=int,
         default=None,
-        help="Number of trials for MIPRO (defaults to ~3.6 * num_candidates)",
+        help="Number of trials for MIPRO (defaults to DSPy's formula: max(2*num_vars*log2(N), 1.5*N))",
+    )
+    parser.add_argument(
+        "--eval-timeout",
+        type=int,
+        default=600,
+        help="Timeout in seconds for each sample evaluation (default: 600 = 10 minutes)",
+    )
+    parser.add_argument(
+        "--optimizer-temperature",
+        type=float,
+        default=1.0,
+        help="Temperature for DSPy optimizer prompt generation (default: 1.0 = neutral)",
     )
     parser.add_argument(
         "--output", type=str, default="optimized_prompts.json", help="Output file"
@@ -640,6 +730,12 @@ if __name__ == "__main__":
         default=None,
         help="Comma-separated list of specific task paths (e.g., 'astabench/sqa_dev,astabench/litqa2_validation'). Mutually exclusive with --task-split.",
     )
+    parser.add_argument(
+        "--agent-max-steps",
+        type=int,
+        default=10,
+        help="Maximum number of steps for the agent (default: 10)",
+    )
 
     args = parser.parse_args()
 
@@ -658,6 +754,9 @@ if __name__ == "__main__":
     # Set task_split to None if using --tasks
     task_split = None if tasks else args.task_split
 
+    # Build agent_kwargs from CLI arguments
+    agent_kwargs = {"max_steps": args.agent_max_steps}
+
     optimize_prompts(
         models=models,
         optimizer_model=args.optimizer_model,
@@ -670,4 +769,7 @@ if __name__ == "__main__":
         config_path=args.config_path,
         task_split=task_split,
         tasks=tasks,
+        eval_timeout=args.eval_timeout,
+        optimizer_temperature=args.optimizer_temperature,
+        agent_kwargs=agent_kwargs,
     )
