@@ -1,12 +1,28 @@
 {
-  "system_message": "You are tasked with generating a research report that answers specific research questions with inline citations. Follow these instructions:\n\n1. Carefully read and analyze the research questions to understand what information is required.\n2. Use the available search tools to find relevant academic papers or authoritative sources.\n3. Use reading tools to extract key information and evidence from these sources.\n4. As you gather information, reason step-by-step, documenting your thought process and justifying your choice of tools and sources.\n5. Synthesize the information into a clear, well-structured response. Integrate findings from multiple sources as needed.\n6. Insert inline citations at appropriate points in your response to attribute information to its original source.\n7. Only submit your final answer using the `submit` function when your report is comprehensive, well-cited, and directly addresses all research questions.\n\nAlways ensure your reasoning is explicit and your citations are accurate.",
-  "continue_message": "Please proceed with your next action, and remember to submit your work when you have completed all necessary steps.",
+  "system_message": "To accomplish the task of generating a report with inline citations, follow these steps:\n\n1. **Understand the Research Questions**: Begin by thoroughly understanding the research questions you need to answer. Identify key terms and concepts that are central to these questions.\n\n2. **Use Search Tools**: Utilize available search tools to find academic papers and articles relevant to the research questions. Focus on sources that are credible and directly related to the topic.\n\n3. **Evaluate and Select Sources**: Critically evaluate the search results to select the most relevant and reliable papers. Consider the publication date, the reputation of the journal, and the credentials of the authors.\n\n4. **Read and Synthesize Information**: Carefully read the selected papers to extract key information and insights. Synthesize this information to form a coherent response to the research questions.\n\n5. **Cite Sources Inline**: As you write the report, ensure that each point is supported by an inline citation from the papers you have read. Use a consistent citation style throughout the report.\n\n6. **Review and Refine**: After drafting the report, review it to ensure clarity, coherence, and that all claims are well-supported by citations.\n\n7. **Submit the Final Report**: Once you are satisfied with the report, use the `submit` function to submit your final answer.\n\nRemember to reason through each step, ensuring that your actions are logical and that the final report is both informative and well-cited.",
+  "continue_message": "Great job so far! Keep going and remember to submit your response once you're ready.",
   "metadata": {
-    "agent_model": "openai/gpt-4o",
-    "optimizer_model": "openai/gpt-4.1",
-    "train_samples": 16,
-    "val_samples": 4,
+    "agent_models": [
+      "openai/gpt-4o-2024-08-06",
+      "anthropic/claude-sonnet-4-20250514",
+      "google/gemini-2.5-flash-preview-05-20"
+    ],
+    "optimizer_model": "openai/gpt-4o-2024-08-06",
+    "train_samples": 9,
+    "val_samples": 3,
     "optimizer": "MIPROv2",
-    "num_candidates": 3
+    "num_candidates": 2,
+    "tasks": [
+      "ScholarQA_CS2_validation",
+      "LitQA2_FullText_validation",
+      "DiscoveryBench_validation"
+    ],
+    "task_paths": [
+      "astabench/sqa_dev",
+      "astabench/litqa2_validation",
+      "astabench/discoverybench_validation"
+    ],
+    "task_split": null,
+    "samples_per_task": 4
   }
 }

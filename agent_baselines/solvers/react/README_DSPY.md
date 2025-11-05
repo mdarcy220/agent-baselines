@@ -1,6 +1,9 @@
 # DSPy Prompt Optimization for ReAct Agent
 
-This directory contains a DSPy-based prompt optimization system for the ReAct agent on the `astabench/sqa_dev` task.
+This directory contains a DSPy-based prompt optimization system for the ReAct agent. It supports:
+- **Multi-task optimization**: Optimize prompts across all astabench tasks simultaneously
+- **Multi-model optimization**: Evaluate prompts on multiple models and average scores
+- **Subprocess isolation**: Parallel evaluation bypassing inspect_ai's concurrent call restriction
 
 ## Overview
 
@@ -12,16 +15,20 @@ The DSPy integration optimizes the following prompts:
 
 The optimization pipeline follows this flow:
 
-1. **DSPy generates candidate prompts** using GEPA or MIPROv2 optimizer
-2. **For each candidate prompt**:
-   - Create a solver with those prompts using `create_agent_with_dspy_prompts()`
-   - Run `inspect_ai.eval()` with that solver on a specific sample (using `sample_id` parameter)
-   - Extract the `global_avg` score from the evaluation results
-   - Return the score to DSPy
-3. **DSPy optimizes** based on per-sample scores across the training set
-4. **Save optimized prompts** to JSON file
+1. **Load tasks from astabench config** (v1.0.0.yml with all task metadata)
+2. **DSPy generates candidate prompts** using GEPA or MIPROv2 optimizer
+3. **For each candidate prompt**:
+   - For each sample (from any task):
+     - Create a solver with those prompts using `create_agent_with_dspy_prompts()`
+     - Run `inspect_ai.eval()` in a subprocess on that sample
+     - Evaluate on all specified models (e.g., GPT-4, Claude)
+     - Extract the task's primary metric from results (e.g., `global_avg/mean` for SQA)
+     - Average scores across models
+     - Return the averaged score to DSPy
+4. **DSPy optimizes** based on per-sample scores across all tasks and models
+5. **Save optimized prompts** to JSON file
 
-**Key insight**: DSPy only generates prompts; all agent execution and scoring happens through inspect_ai's framework, which ensures proper TaskState construction and task-specific tool provision.
+**Key insight**: DSPy only generates prompts; all agent execution and scoring happens through inspect_ai's framework, which ensures proper TaskState construction and task-specific tool provision. Tasks provide their own tools, so prompts must be general enough to work across all task types.
 
 ## Files
 
@@ -51,29 +58,56 @@ export ASTA_TOOL_KEY=...  # For search tools in sqa_dev
 Run the optimization script to generate optimized prompts:
 
 ```bash
-# Basic usage (uses 20 train samples, 10 val samples)
-python agent_baselines/solvers/react/optimize.py
-
-# With custom parameters
+# Specific tasks (SQA and LitQA2)
 python agent_baselines/solvers/react/optimize.py \
-    --model openai/gpt-4o \
+    --models openai/gpt-4o \
+    --tasks "astabench/sqa_dev,astabench/litqa2_validation" \
+    --samples-per-task 5
+
+# All validation tasks (default)
+python agent_baselines/solvers/react/optimize.py \
+    --models openai/gpt-4o \
+    --samples-per-task 3 \
+    --num-candidates 5
+
+# Multi-model optimization (optimize for GPT-4 and Claude)
+python agent_baselines/solvers/react/optimize.py \
+    --models "openai/gpt-4o,anthropic/claude-3-5-sonnet-20241022" \
     --optimizer-model openai/gpt-4o-mini \
-    --train-limit 50 \
-    --val-limit 20 \
-    --num-candidates 10 \
-    --output optimized_prompts.json
+    --tasks "astabench/sqa_dev,astabench/litqa2_validation" \
+    --samples-per-task 2 \
+    --num-candidates 3
+
+# Single task only
+python agent_baselines/solvers/react/optimize.py \
+    --models openai/gpt-4o \
+    --tasks astabench/sqa_dev \
+    --samples-per-task 10 \
+    --num-candidates 5
+
+# All test tasks
+python agent_baselines/solvers/react/optimize.py \
+    --models openai/gpt-4o \
+    --task-split test \
+    --samples-per-task 3
 ```
 
 **Parameters**:
-- `--model`: Model to use for running the agent (the one being optimized)
-- `--optimizer-model`: Model to use for DSPy optimization (generating candidate prompts). Can be cheaper/faster than agent model.
-- `--train-limit`: Total number of samples to load (will be split into train/val)
-- `--val-limit`: Maximum validation samples to use
+- `--models`: Comma-separated list of models to evaluate on (scores averaged across models)
+- `--optimizer-model`: Model to use for DSPy optimization (generating candidate prompts). Can be cheaper/faster than agent models.
+- `--samples-per-task`: Maximum samples to use per task (keeps cost manageable with many tasks)
 - `--train-ratio`: Ratio of samples for training (default: 0.8)
 - `--num-candidates`: Number of candidate prompts GEPA/MIPROv2 will generate
 - `--output`: Output file for optimized prompts
+- `--config-path`: Path to astabench config (default: uses astabench v1.0.0.yml)
+- `--task-split`: Which split to use (default: "validation"). Mutually exclusive with `--tasks`.
+- `--tasks`: Comma-separated list of specific task paths. Mutually exclusive with `--task-split`.
 
-**Note**: Optimization can be expensive! Each candidate prompt runs a full `inspect_ai.eval()` on each training sample. Start with small values (e.g., 5-10 train samples, 3 candidates) for testing.
+**Note**: Multi-task, multi-model optimization can be very expensive! Each candidate prompt runs a full `inspect_ai.eval()` on each training sample for each model. Start with small values:
+- `--samples-per-task 2-3` (2-3 samples per task)
+- `--num-candidates 3` (3 candidate prompts)
+- `--tasks astabench/sqa_dev` (start with single task)
+- Single model first, then try multi-model
 
 ### Step 2: Evaluate Optimized Agent
 
@@ -189,6 +223,79 @@ Always validate on held-out samples:
 - Run the full evaluation script to compare on a larger test set
 - Check that optimized prompts generalize beyond the training samples
 
+## Multi-Task Optimization
+
+### Specifying Tasks
+
+You can optimize across tasks in two ways:
+
+1. **Use `--task-split`**: Load all tasks from a config split (validation or test)
+2. **Use `--tasks`**: Specify exact task paths from the config
+
+```bash
+# All validation tasks (default)
+python agent_baselines/solvers/react/optimize.py \
+    --models openai/gpt-4o \
+    --samples-per-task 3
+
+# Specific literature tasks
+python agent_baselines/solvers/react/optimize.py \
+    --models openai/gpt-4o \
+    --tasks "astabench/sqa_dev,astabench/litqa2_validation,astabench/paper_finder_validation" \
+    --samples-per-task 5
+
+# Specific code tasks
+python agent_baselines/solvers/react/optimize.py \
+    --models openai/gpt-4o \
+    --tasks "astabench/ds1000_validation,astabench/core_bench_validation" \
+    --samples-per-task 3
+```
+
+### Available Tasks
+
+From the astabench v1.0.0 config, validation split tasks include:
+- **Literature**: `astabench/sqa_dev`, `astabench/litqa2_validation`, `astabench/paper_finder_validation`, `astabench/paper_finder_litqa2_validation`, `astabench/arxivdigestables_validation`
+- **Code**: `astabench/core_bench_validation`, `astabench/ds1000_validation`, `astabench/super_validation`
+- **Data/Discovery**: `astabench/discoverybench_validation`, `astabench/e2e_discovery_validation`, `astabench/e2e_discovery_hard_validation`
+
+### Multi-Model Strategy
+
+When optimizing for multiple models:
+1. **Start with one model** to validate the approach
+2. **Add similar models** (e.g., GPT-4 and GPT-4-turbo)
+3. **Test cross-family** (e.g., OpenAI + Anthropic) for robustness
+
+```bash
+# Single model first
+python agent_baselines/solvers/react/optimize.py \
+    --models openai/gpt-4o \
+    --samples-per-task 5
+
+# Then multi-model
+python agent_baselines/solvers/react/optimize.py \
+    --models "openai/gpt-4o,anthropic/claude-3-5-sonnet-20241022" \
+    --samples-per-task 3
+```
+
+### Primary Metrics
+
+Each task has a primary metric extracted from results:
+- SQA: `global_avg/mean`
+- DiscoveryBench: `score_discoverybench/mean`
+- LitQA2: `is_correct/accuracy`
+- PaperFinder: `score_paper_finder/adjusted_f1_micro_avg`
+
+The optimizer averages these heterogeneous metrics across tasks, treating all tasks equally.
+
+### Cost Estimation
+
+With multi-task, multi-model optimization:
+- **Single task, single model**: ~5 samples × 3 candidates = 15 evals
+- **5 tasks, single model**: ~5 samples/task × 5 tasks × 3 candidates = 75 evals
+- **5 tasks, 2 models**: ~5 samples/task × 5 tasks × 2 models × 3 candidates = 150 evals
+
+Start small and scale up gradually!
+
 ## Troubleshooting
 
 ### `No global_avg found in scores`
@@ -215,42 +322,61 @@ uv pip install --upgrade dspy-ai
 
 ## Example Output
 
-After optimization completes, you'll see:
+After multi-task optimization completes, you'll see:
 
 ```
 ============================================================
-Optimization complete!
+Multi-Task, Multi-Model Optimization Complete!
 ============================================================
 
 Optimized prompts saved to: agent_baselines/solvers/react/optimized_prompts.json
 
 Optimized System Message:
 ------------------------------------------------------------
-You are a research assistant tasked with answering questions by...
+You are a research assistant that can use various tools to complete tasks.
+Follow these guidelines:
+1. Break down complex problems into steps
+2. Use available tools effectively
+3. Cite sources when applicable
+...
 [optimized prompt text]
 
 Optimized Continue Message:
 ------------------------------------------------------------
-Continue with the next step in your research plan...
+Continue with the next step. Use your available tools to make progress.
 [optimized prompt text]
 
 ============================================================
-Validation score (first sample): 0.7234
+
+Optimization Details:
+   Agent models (for evaluation): openai/gpt-4o, anthropic/claude-3-5-sonnet-20241022
+   Optimizer model (for prompt generation): openai/gpt-4o-mini
+   Tasks optimized: 11 tasks (validation split)
+   Total training samples: 44 across all tasks
+
+To use the optimized agent on any task, run:
+  uv run astabench eval <task_path> \
+    --solver agent_baselines/solvers/react/optimized_agent.py@instantiated_optimized_agent \
+    --model <model_name>
 ```
 
-The optimized prompts are saved as JSON:
+The optimized prompts are saved as JSON with metadata:
 
 ```json
 {
   "system_message": "...",
   "continue_message": "...",
   "metadata": {
-    "agent_model": "openai/gpt-4o",
-    "optimizer_model": "openai/gpt-4o",
-    "train_samples": 16,
-    "val_samples": 4,
-    "optimizer": "GEPA",
-    "num_candidates": 5
+    "agent_models": ["openai/gpt-4o", "anthropic/claude-3-5-sonnet-20241022"],
+    "optimizer_model": "openai/gpt-4o-mini",
+    "train_samples": 44,
+    "val_samples": 11,
+    "optimizer": "MIPROv2",
+    "num_candidates": 5,
+    "tasks": ["ScholarQA_CS2_validation", "LitQA2_FullText_validation", ...],
+    "task_paths": ["astabench/sqa_dev", "astabench/litqa2_validation", ...],
+    "task_split": "validation",
+    "samples_per_task": 5
   }
 }
 ```

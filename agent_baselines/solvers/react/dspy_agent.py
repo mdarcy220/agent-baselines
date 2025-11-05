@@ -14,30 +14,54 @@ from agent_baselines.solvers.react.basic_agent import (
 
 
 class SystemMessageSignature(dspy.Signature):
-    """Generate a system message for a ReAct agent that uses tools to answer questions.
+    """Generate a system message for a ReAct agent solving diverse research and analysis tasks.
 
-    The agent needs to understand:
-    - How to use available functions/tools
-    - When to submit an answer
-    - How to reason before taking actions
+    The agent will receive a specific task (which may be a research question, data analysis problem,
+    math calculation, coding challenge, or document analysis task) and must use available tools
+    to solve it. Different task types require different approaches:
+
+    - Research questions: Use search tools to find and cite relevant sources
+    - Math/data problems: Use calculation or code execution tools
+    - Multi-step problems: Break down into subtasks and use tools iteratively
+    - Document analysis: Read and extract information from provided documents
+
+    The system message should:
+    - Clearly explain the task goal from task_description (which includes the actual question)
+    - Describe when and how to use available tools (tools are provided by the task environment)
+    - Emphasize the importance of calling submit_function_name when done with the final answer
+    - Encourage step-by-step reasoning before taking actions
+    - Be concise but complete - avoid unnecessary verbosity
     """
 
     task_description = dspy.InputField(
-        desc="Description of what the agent needs to accomplish"
+        desc="Complete description of the specific task to solve, including the actual question or problem statement. Format: 'Task: [task_name]\\n\\nQuestion: [actual question]'"
     )
     submit_function_name = dspy.InputField(
-        desc="Name of the function to call when submitting the final answer"
+        desc="Name of the function the agent must call to submit the final answer (e.g., 'submit_answer', 'submit_code'). This function will be available as a tool."
     )
     system_message = dspy.OutputField(
-        desc="Clear, effective instructions for the agent"
+        desc="Complete system message that prepares the agent to solve this specific task. Should be clear, actionable, and tailored to the task type."
     )
 
 
 class ContinueMessageSignature(dspy.Signature):
-    """Generate a message to urge the agent to continue when it doesn't make a tool call."""
+    """Generate a brief message to encourage the agent to continue working when it hasn't made a tool call.
+
+    This message helps the agent:
+    - Stay on track toward completing the task
+    - Remember to use tools when needed to make progress
+    - Know when it's time to submit the final answer
+    - Avoid getting stuck or giving up prematurely
+
+    The continue message should be:
+    - Brief (1-2 sentences)
+    - Motivating but not pushy
+    - Remind the agent of its goal without being repetitive
+    - Generic enough to work across different task types
+    """
 
     continue_message = dspy.OutputField(
-        desc="A brief message encouraging the agent to proceed and reminding it to submit when done"
+        desc="Brief, motivating message (1-2 sentences) that reminds the agent to proceed with the task and use tools or submit when ready"
     )
 
 
@@ -55,16 +79,33 @@ class DSPyReActPrompts(dspy.Module):
         """Generate optimized prompts for the ReAct agent.
 
         Args:
-            task_description: Description of the task the agent needs to accomplish
-            submit_function_name: Name of the submission function
+            task_description: The specific task/question the agent needs to solve.
+                             Format: "Task: [task_name]\\n\\nQuestion: [actual question]"
+            submit_function_name: Function name for submitting the final answer
 
         Returns:
-            dict with 'system_message' and 'continue_message' keys
+            Prediction with 'system_message' and 'continue_message' fields
         """
+        # Generate task-specific system message
+        # The system message sets up the agent's understanding of:
+        # - What the specific task is asking for (from task_description)
+        # - What tools are available (provided by the task environment, not specified here)
+        # - When to call submit_function_name with the final answer
+        # - How to approach the problem (reasoning, tool use, etc.)
+        #
+        # This is generated using ChainOfThought, so DSPy optimizers can see
+        # the reasoning process during bootstrap/optimization
         system_result = self.system_message_generator(
             task_description=task_description,
             submit_function_name=submit_function_name,
         )
+
+        # Generate continuation prompt for when agent stalls
+        # This helps the agent recover when it fails to make progress after
+        # using a tool or when it seems stuck. The continue message should:
+        # - Not be overly repetitive (agent sees it multiple times)
+        # - Encourage forward progress without being pushy
+        # - Be generic enough to work across diverse task types
         continue_result = self.continue_message_generator()
 
         return dspy.Prediction(
