@@ -38,7 +38,8 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
-EVAL_STD_LOG_DIR = ".dspy_cache/eval_logs"
+# Base directory for all DSPy optimization runs
+DSPY_CACHE_BASE = ".dspy_cache"
 
 
 def log_block(
@@ -76,6 +77,21 @@ GENERIC_TASK_DESCRIPTION = """You will be given a task to complete. Use the avai
 # Target number of samples per task when calculating adaptive minibatch size.
 # This ensures adequate coverage across all task types during MIPRO optimization.
 SAMPLES_PER_TASK_FOR_MINIBATCH = 5
+
+
+def create_run_directory(base_dir: str = DSPY_CACHE_BASE) -> str:
+    """Create a timestamped run directory for this optimization run.
+
+    Args:
+        base_dir: Base directory for all runs (default: .dspy_cache)
+
+    Returns:
+        Path to the created run directory (e.g., .dspy_cache/run_20251106_123045)
+    """
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    run_dir = f"{base_dir}/run_{timestamp}"
+    os.makedirs(run_dir, exist_ok=True)
+    return run_dir
 
 
 class LLMCallLogger(BaseCallback):
@@ -230,6 +246,7 @@ def create_metric_function(
     optimizer_type: str = "mipro",
     eval_timeout: int = 600,
     agent_kwargs: dict | None = None,
+    eval_log_dir: str | None = None,
 ):
     """Create a metric function that evaluates agent performance across tasks and models.
 
@@ -244,6 +261,7 @@ def create_metric_function(
         optimizer_type: Type of optimizer ("mipro" or "gepa") for feedback support
         eval_timeout: Timeout in seconds for each sample evaluation
         agent_kwargs: Additional keyword arguments to pass to the agent solver (e.g., {"max_steps": 10})
+        eval_log_dir: Directory for eval logs (default: uses global EVAL_STD_LOG_DIR)
 
     Returns:
         A function that takes (example, prediction, trace, pred_name, pred_trace) and returns:
@@ -274,15 +292,20 @@ def create_metric_function(
         primary_metric = example.primary_metric
         task_name = example.task_name
 
+        # Use provided eval_log_dir or fall back to default
+        log_dir = (
+            eval_log_dir if eval_log_dir is not None else f"{DSPY_CACHE_BASE}/eval_logs"
+        )
+
         # Create log directory for this evaluation
-        os.makedirs(EVAL_STD_LOG_DIR, exist_ok=True)
+        os.makedirs(log_dir, exist_ok=True)
 
         # Create unique log file for this sample evaluation
         # Use timestamp to avoid collisions if same sample is evaluated multiple times
         import time
 
         timestamp = int(time.time() * 1000)
-        std_log_file = f"{EVAL_STD_LOG_DIR}/{sample_id}_{timestamp}.log"
+        std_log_file = f"{log_dir}/{sample_id}_{timestamp}.log"
 
         # Print clearer DSPy-level logging
         log_block(
@@ -314,6 +337,7 @@ def create_metric_function(
             logger.info(
                 f"✓ Sample {sample_id} completed: avg score = {score_value:.4f}\n"
             )
+
             return score_value
 
         except Exception as e:
@@ -497,6 +521,7 @@ def optimize_prompts(
     optimizer_temperature: float = 1.0,
     agent_kwargs: dict | None = None,
     verbose_llm: bool = False,
+    base_cache_dir: str = DSPY_CACHE_BASE,
 ):
     """Run DSPy optimization on ReAct agent prompts across multiple tasks and models.
 
@@ -519,9 +544,29 @@ def optimize_prompts(
         agent_kwargs: Additional keyword arguments to pass to the agent solver (e.g., {"max_steps": 10}).
                      Defaults to {"max_steps": 10} for backward compatibility.
         verbose_llm: If True, log all LLM calls during optimization to a timestamped file
+        base_cache_dir: Base directory for all caching (default: .dspy_cache)
     """
     if agent_kwargs is None:
         agent_kwargs = {"max_steps": 10}
+
+    # Create run directory for this optimization run
+    run_dir = create_run_directory(base_cache_dir)
+
+    log_block(
+        f"""
+        RUN DIRECTORY CREATED
+
+        All outputs for this optimization run will be saved to:
+          {run_dir}
+
+        This includes:
+          - LLM call logs (if --verbose-llm)
+          - Evaluation logs (per-sample)
+          - Evaluated programs (MIPRO candidates)
+          - Inspect AI eval outputs
+        """,
+    )
+
     # Convert single model to list
     if isinstance(models, str):
         models = [models]
@@ -532,8 +577,7 @@ def optimize_prompts(
 
     # Configure LLM call logging if requested
     if verbose_llm:
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        llm_log_file = f".dspy_cache/llm_calls_{timestamp}.log"
+        llm_log_file = f"{run_dir}/llm_calls.log"
         llm_logger = LLMCallLogger(llm_log_file)
         dspy.settings.configure(lm=lm, callbacks=[llm_logger])
         logger.info(f"LLM call logging enabled: {llm_log_file}")
@@ -580,8 +624,12 @@ def optimize_prompts(
 
     # Create metric function that uses subprocess-based eval
     logger.info("Creating metric function (subprocess-based for parallelization)...")
+    eval_log_dir = f"{run_dir}/eval_logs"
     metric = create_metric_function(
-        models, eval_timeout=eval_timeout, agent_kwargs=agent_kwargs
+        models,
+        eval_timeout=eval_timeout,
+        agent_kwargs=agent_kwargs,
+        eval_log_dir=eval_log_dir,
     )
 
     # Set up optimizer based on type
@@ -616,6 +664,7 @@ def optimize_prompts(
             auto=None,  # Enable manual mode
             num_candidates=num_candidates,
             init_temperature=optimizer_temperature,
+            log_dir=run_dir,  # Save all candidate programs during optimization
         )
         optimizer_name = "MIPROv2"
         # Calculate num_trials for compile() call (MIPRO needs it there, not in __init__)
@@ -711,7 +760,8 @@ def optimize_prompts(
             f"Estimated total evaluations: ~{mipro_num_trials * minibatch_size * len(models)}"
         )
 
-    logger.info("Detailed per-sample logs are being written to: %s", EVAL_STD_LOG_DIR)
+    logger.info("Detailed per-sample logs are being written to: %s", eval_log_dir)
+    logger.info("Candidate programs will be saved to: %s/evaluated_programs/", run_dir)
 
     optimized_module = optimizer.compile(react_prompts, **compile_kwargs)
 
@@ -782,7 +832,20 @@ def optimize_prompts(
     logger.info(
         f"\n✓ Multi-task optimization completed successfully using subprocess isolation!"
     )
-    logger.info("")
+
+    log_block(
+        f"""
+        ALL OUTPUTS SAVED TO: {run_dir}
+
+        Run directory contents:
+          - llm_calls.log (if --verbose-llm was used)
+          - eval_logs/ (per-sample evaluation logs)
+          - evaluated_programs/ (MIPRO candidate programs)
+          - <inspect_ai_eval_outputs>
+
+        You can review this run's outputs anytime by examining: {run_dir}
+        """,
+    )
 
     return optimized_prompts
 
