@@ -16,10 +16,12 @@ import json
 import logging
 import os
 import textwrap
+import time
 from pathlib import Path
 
 import dspy
 import numpy as np
+from dspy.utils.callback import BaseCallback
 
 from agent_baselines.solvers.react.basic_agent import (
     DEFAULT_SUBMIT_NAME,
@@ -35,6 +37,8 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+
+EVAL_STD_LOG_DIR = ".dspy_cache/eval_logs"
 
 
 def log_block(
@@ -72,6 +76,77 @@ GENERIC_TASK_DESCRIPTION = """You will be given a task to complete. Use the avai
 # Target number of samples per task when calculating adaptive minibatch size.
 # This ensures adequate coverage across all task types during MIPRO optimization.
 SAMPLES_PER_TASK_FOR_MINIBATCH = 5
+
+
+class LLMCallLogger(BaseCallback):
+    """Callback to log all LLM calls during DSPy optimization to a file."""
+
+    def __init__(self, log_file: str):
+        """Initialize logger with output file path.
+
+        Args:
+            log_file: Path to file where LLM calls will be logged
+        """
+        self.log_file = log_file
+        self.call_count = 0
+
+        # Create log directory if needed
+        log_dir = os.path.dirname(log_file)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+
+        # Clear/create the log file
+        with open(log_file, "w") as f:
+            f.write(
+                f"DSPy LLM Call Log - Started at {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            )
+            f.write("=" * 80 + "\n\n")
+
+    def on_lm_start(self, call_id, instance, inputs):
+        """Log LLM call inputs."""
+        self.call_count += 1
+
+        with open(self.log_file, "a") as f:
+            f.write(f"\n{'='*80}\n")
+            f.write(
+                f"LLM CALL #{self.call_count} - {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            )
+            f.write(f"Model: {instance.model}\n")
+            f.write(f"Call ID: {call_id}\n")
+            f.write(f"{'='*80}\n\n")
+
+            # Log messages or prompt
+            if inputs.get("messages"):
+                f.write("MESSAGES:\n")
+                for msg in inputs["messages"]:
+                    f.write(f"\n[{msg['role'].upper()}]\n")
+                    f.write(f"{msg['content']}\n")
+            elif inputs.get("prompt"):
+                f.write("PROMPT:\n")
+                f.write(f"{inputs['prompt']}\n")
+
+            # Log any additional kwargs (temperature, max_tokens, etc.)
+            other_params = {
+                k: v for k, v in inputs.items() if k not in ["prompt", "messages"]
+            }
+            if other_params:
+                f.write(f"\nPARAMETERS:\n{json.dumps(other_params, indent=2)}\n")
+
+    def on_lm_end(self, call_id, outputs, exception):
+        """Log LLM call outputs."""
+        with open(self.log_file, "a") as f:
+            f.write(f"\nOUTPUT (Call ID: {call_id}):\n")
+
+            if exception:
+                f.write(f"ERROR: {exception}\n")
+            else:
+                for i, output in enumerate(outputs):
+                    if isinstance(output, dict):
+                        f.write(f"{output.get('text', str(output))}\n")
+                    else:
+                        f.write(f"{output}\n")
+
+            f.write(f"\n{'='*80}\n\n")
 
 
 def load_tasks_from_config(
@@ -200,15 +275,14 @@ def create_metric_function(
         task_name = example.task_name
 
         # Create log directory for this evaluation
-        log_dir = ".dspy_cache/eval_logs"
-        os.makedirs(log_dir, exist_ok=True)
+        os.makedirs(EVAL_STD_LOG_DIR, exist_ok=True)
 
         # Create unique log file for this sample evaluation
         # Use timestamp to avoid collisions if same sample is evaluated multiple times
         import time
 
         timestamp = int(time.time() * 1000)
-        std_log_file = f"{log_dir}/{sample_id}_{timestamp}.log"
+        std_log_file = f"{EVAL_STD_LOG_DIR}/{sample_id}_{timestamp}.log"
 
         # Print clearer DSPy-level logging
         log_block(
@@ -334,19 +408,17 @@ def create_mixed_dspy_examples(
     def create_examples(tuples):
         examples = []
         for task_path, primary_metric, task_name, sample in tuples:
-            # Create task description that includes actual content
-            # This gives DSPy optimizers real task data to work with
-            task_description = f"Task: {task_name}\n\nQuestion: {sample.input}"
-
-            # Create a DSPy example with full sample data
+            # Use generic task description (same for all) to ensure universal prompts
+            # Real questions stored as metadata for dataset summary observation
             example = dspy.Example(
-                task_description=task_description,  # Now includes actual question!
+                task_description=GENERIC_TASK_DESCRIPTION,
                 submit_function_name=DEFAULT_SUBMIT_NAME,
-                sample=sample,  # Full sample object for metric if needed
+                question=sample.input,
+                task_name=task_name,
                 sample_id=sample.id,
                 task_path=task_path,
                 primary_metric=primary_metric,
-                task_name=task_name,
+                sample=sample,
             ).with_inputs("task_description", "submit_function_name")
 
             examples.append(example)
@@ -356,6 +428,55 @@ def create_mixed_dspy_examples(
     val_examples = create_examples(val_tuples)
 
     return train_examples, val_examples
+
+
+def interleave_tasks(examples: list, rng=None) -> list:
+    """Interleave examples from different tasks to ensure early diversity.
+
+    For multi-task optimization, MIPRO's dataset observation views the first ~10
+    examples sequentially. If all early examples are from one task, MIPRO will
+    incorrectly believe it's single-task optimization.
+
+    This function shuffles within each task, then interleaves tasks in round-robin
+    fashion (e.g., [task_a1, task_b1, task_c1, task_a2, task_b2, task_c2, ...]).
+
+    Args:
+        examples: List of DSPy examples with task_name attribute
+        rng: Random number generator for reproducibility
+
+    Returns:
+        Interleaved list ensuring all tasks appear in the first N examples
+    """
+    import random
+
+    rng = rng or random
+
+    # Group examples by task
+    by_task = {}
+    for ex in examples:
+        task = ex.task_name
+        by_task.setdefault(task, []).append(ex)
+
+    # Shuffle within each task
+    for task in sorted(by_task.keys()):  # Sort for reproducibility
+        rng.shuffle(by_task[task])
+
+    # Interleave tasks in round-robin fashion
+    interleaved = []
+    task_names = sorted(by_task.keys())
+    max_task_size = max(len(group) for group in by_task.values())
+
+    for i in range(max_task_size):
+        for task in task_names:
+            if i < len(by_task[task]):
+                interleaved.append(by_task[task][i])
+
+    # Log distribution for verification
+    logger.info("Interleaved task distribution (first 20 examples):")
+    for i, ex in enumerate(interleaved[:20]):
+        logger.info(f"  [{i:2d}] {ex.task_name}")
+
+    return interleaved
 
 
 def optimize_prompts(
@@ -375,6 +496,7 @@ def optimize_prompts(
     eval_timeout: int = 600,
     optimizer_temperature: float = 1.0,
     agent_kwargs: dict | None = None,
+    verbose_llm: bool = False,
 ):
     """Run DSPy optimization on ReAct agent prompts across multiple tasks and models.
 
@@ -396,6 +518,7 @@ def optimize_prompts(
         optimizer_temperature: Temperature for DSPy optimizer prompt generation
         agent_kwargs: Additional keyword arguments to pass to the agent solver (e.g., {"max_steps": 10}).
                      Defaults to {"max_steps": 10} for backward compatibility.
+        verbose_llm: If True, log all LLM calls during optimization to a timestamped file
     """
     if agent_kwargs is None:
         agent_kwargs = {"max_steps": 10}
@@ -406,8 +529,17 @@ def optimize_prompts(
     # Set up DSPy language model for generating candidate prompts
     optimizer_model = optimizer_model or models[0]
     lm = dspy.LM(model=optimizer_model)
-    # Allow DSPy to use default parallelization (we use subprocesses for eval isolation)
-    dspy.settings.configure(lm=lm)
+
+    # Configure LLM call logging if requested
+    if verbose_llm:
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        llm_log_file = f".dspy_cache/llm_calls_{timestamp}.log"
+        llm_logger = LLMCallLogger(llm_log_file)
+        dspy.settings.configure(lm=lm, callbacks=[llm_logger])
+        logger.info(f"LLM call logging enabled: {llm_log_file}")
+    else:
+        # Allow DSPy to use default parallelization (we use subprocesses for eval isolation)
+        dspy.settings.configure(lm=lm)
 
     logger.info(f"Agent models: {', '.join(models)}")
     logger.info(f"Optimizer model: {optimizer_model}")
@@ -517,19 +649,27 @@ def optimize_prompts(
     logger.info(f"Using {optimizer_name} optimizer")
 
     # Run optimization
+    # Interleave tasks to ensure MIPRO's dataset observation sees all task types
+    # MIPRO views first ~10 examples sequentially for dataset summarization
+    # Interleaving ensures all tasks appear in those first examples
+    import random
+
+    rng = random.Random(42)  # Reproducible interleaving
+    train_examples_interleaved = interleave_tasks(train_examples, rng=rng)
+
     log_block(
         f"""
         STARTING DSPY OPTIMIZATION
 
         Optimizer: {optimizer_name}
-        Training samples: {len(train_examples)}
+        Training samples: {len(train_examples_interleaved)}
         Models being optimized for: {', '.join(models)}
     """,
     )
 
     # Prepare compile() arguments based on optimizer type
     compile_kwargs = {
-        "trainset": train_examples,
+        "trainset": train_examples_interleaved,
         "max_bootstrapped_demos": max_bootstrapped_demos,
         "max_labeled_demos": max_labeled_demos,
     }
@@ -542,18 +682,20 @@ def optimize_prompts(
         # Must not exceed validation set size (DSPy internal requirement)
         num_tasks = len(task_configs)
         desired_minibatch = num_tasks * SAMPLES_PER_TASK_FOR_MINIBATCH
-        minibatch_size = min(len(train_examples), len(val_examples), desired_minibatch)
+        minibatch_size = min(
+            len(train_examples_interleaved), len(val_examples), desired_minibatch
+        )
         compile_kwargs["minibatch_size"] = minibatch_size
         compile_kwargs["minibatch"] = True
         logger.info(
             f"Minibatch size: {minibatch_size} "
-            f"(adaptive: min(train={len(train_examples)}, val={len(val_examples)}, "
+            f"(adaptive: min(train={len(train_examples_interleaved)}, val={len(val_examples)}, "
             f"{num_tasks} tasks × {SAMPLES_PER_TASK_FOR_MINIBATCH}))"
         )
 
         # Warn if validation set size is limiting the adaptive sizing
         if len(val_examples) < desired_minibatch and len(val_examples) < len(
-            train_examples
+            train_examples_interleaved
         ):
             logger.warning(
                 f"Validation set size ({len(val_examples)}) is limiting minibatch size. "
@@ -563,15 +705,13 @@ def optimize_prompts(
             )
         logger.info(f"Number of trials: {mipro_num_trials}")
         logger.info(
-            f"\nEach trial will evaluate {minibatch_size} sample(s) on {len(models)} model(s)"
+            f"Each trial will evaluate {minibatch_size} sample(s) on {len(models)} model(s)"
         )
         logger.info(
             f"Estimated total evaluations: ~{mipro_num_trials * minibatch_size * len(models)}"
         )
 
-    logger.info("\nDSPy will now generate and test candidate prompts...")
-    logger.info("Watch for 'DSPy Metric Evaluation' blocks below to see progress.")
-    logger.info("Detailed per-sample logs are being written to: .dspy_cache/eval_logs/")
+    logger.info("Detailed per-sample logs are being written to: %s", EVAL_STD_LOG_DIR)
 
     optimized_module = optimizer.compile(react_prompts, **compile_kwargs)
 
@@ -700,8 +840,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--eval-timeout",
         type=int,
-        default=600,
-        help="Timeout in seconds for each sample evaluation (default: 600 = 10 minutes)",
+        default=1200,
+        help="Timeout in seconds for each sample evaluation",
     )
     parser.add_argument(
         "--optimizer-temperature",
@@ -735,6 +875,11 @@ if __name__ == "__main__":
         type=int,
         default=10,
         help="Maximum number of steps for the agent (default: 10)",
+    )
+    parser.add_argument(
+        "--verbose-llm",
+        action="store_true",
+        help="Log all LLM calls during optimization to .dspy_cache/llm_calls_<timestamp>.log",
     )
 
     args = parser.parse_args()
@@ -772,4 +917,5 @@ if __name__ == "__main__":
         eval_timeout=args.eval_timeout,
         optimizer_temperature=args.optimizer_temperature,
         agent_kwargs=agent_kwargs,
+        verbose_llm=args.verbose_llm,
     )
