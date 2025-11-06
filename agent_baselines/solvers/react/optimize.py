@@ -17,7 +17,9 @@ import logging
 import os
 import textwrap
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Callable
 
 import dspy
 import numpy as np
@@ -40,6 +42,13 @@ logging.basicConfig(
 
 # Base directory for all DSPy optimization runs
 DSPY_CACHE_BASE = ".dspy_cache"
+
+# Generic task description for generating final optimized prompts (multi-task optimization)
+GENERIC_TASK_DESCRIPTION = """You will be given a task to complete. Use the available tools to help you solve the task, doing reasoning before each action to explain your approach."""
+
+# Target number of samples per task when calculating adaptive minibatch size.
+# This ensures adequate coverage across all task types during MIPRO optimization.
+SAMPLES_PER_TASK_FOR_MINIBATCH = 5
 
 
 def log_block(
@@ -69,14 +78,6 @@ def log_block(
     # Log trailing separator if requested
     if trailing_separator:
         logger.info(separator)
-
-
-# Generic task description for generating final optimized prompts (multi-task optimization)
-GENERIC_TASK_DESCRIPTION = """You will be given a task to complete. Use the available tools to help you solve the task, doing reasoning before each action to explain your approach."""
-
-# Target number of samples per task when calculating adaptive minibatch size.
-# This ensures adequate coverage across all task types during MIPRO optimization.
-SAMPLES_PER_TASK_FOR_MINIBATCH = 5
 
 
 def create_run_directory(base_dir: str = DSPY_CACHE_BASE) -> str:
@@ -165,6 +166,70 @@ class LLMCallLogger(BaseCallback):
             f.write(f"\n{'='*80}\n\n")
 
 
+# ============================================================================
+# Phase Data Structures
+# ============================================================================
+
+
+# Phase 1: Environment Setup
+@dataclass
+class OptimizationRunContext:
+    """Encapsulates environment setup for optimization run."""
+
+    run_dir: str
+    eval_models: list[str]
+    optimizer_model: str
+    agent_config: dict
+
+
+# Phase 2: Data Loading & Preparation
+@dataclass
+class TrainingData:
+    """Encapsulates loaded and prepared training data."""
+
+    task_configs: list[dict]
+    train_examples: list[dspy.Example]
+    val_examples: list[dspy.Example]
+    metric: Callable
+
+
+# Phase 3: Optimizer Selection & Configuration
+@dataclass
+class OptimizerSetup:
+    """Encapsulates optimizer configuration."""
+
+    optimizer: Any
+    optimizer_name: str
+    compile_kwargs: dict
+
+
+# Configuration objects for reducing parameter proliferation
+@dataclass
+class TaskLoadingConfig:
+    """Configuration for loading tasks and samples."""
+
+    config_path: str | None
+    task_split: str | None
+    tasks: list[str] | None
+    samples_per_task: int
+    train_ratio: float
+
+
+@dataclass
+class OptimizationMetadata:
+    """Metadata about the optimization run."""
+
+    optimizer_name: str
+    num_candidates: int | None
+    task_split: str | None
+    samples_per_task: int
+
+
+# ============================================================================
+# Task and Data Loading Functions
+# ============================================================================
+
+
 def load_tasks_from_config(
     config_path: str | None = None,
     split: str | None = "validation",
@@ -245,7 +310,7 @@ def create_metric_function(
     model_names: list[str],
     optimizer_type: str = "mipro",
     eval_timeout: int = 600,
-    agent_kwargs: dict | None = None,
+    agent_config: dict | None = None,
     eval_log_dir: str | None = None,
 ):
     """Create a metric function that evaluates agent performance across tasks and models.
@@ -260,7 +325,7 @@ def create_metric_function(
         model_names: List of model names to evaluate on (scores will be averaged)
         optimizer_type: Type of optimizer ("mipro" or "gepa") for feedback support
         eval_timeout: Timeout in seconds for each sample evaluation
-        agent_kwargs: Additional keyword arguments to pass to the agent solver (e.g., {"max_steps": 10})
+        agent_config: Additional keyword arguments to pass to the agent solver (e.g., {"max_steps": 10})
         eval_log_dir: Directory for eval logs (default: uses global EVAL_STD_LOG_DIR)
 
     Returns:
@@ -268,8 +333,8 @@ def create_metric_function(
         - float score for MIPROv2
         - dict with {"score": float, "feedback": str} for GEPA
     """
-    if agent_kwargs is None:
-        agent_kwargs = {}
+    if agent_config is None:
+        agent_config = {}
 
     def metric(example, prediction, trace=None, pred_name=None, pred_trace=None):
         """DSPy metric function for multi-task, multi-model evaluation.
@@ -330,7 +395,7 @@ def create_metric_function(
                 primary_metric=primary_metric,
                 timeout=eval_timeout,
                 std_log_file=std_log_file,
-                agent_kwargs=agent_kwargs,
+                agent_kwargs=agent_config,
             )
 
             # Print result
@@ -503,53 +568,32 @@ def interleave_tasks(examples: list, rng=None) -> list:
     return interleaved
 
 
-def optimize_prompts(
-    models: list[str] | str = "openai/gpt-4o",
-    optimizer_model: str | None = None,
-    optimizer_type: str = "mipro",
-    samples_per_task: int = 5,
-    train_ratio: float = 0.8,
-    num_candidates: int = 5,
-    num_trials: int | None = None,
-    max_bootstrapped_demos: int = 3,
-    max_labeled_demos: int = 3,
-    output_file: str = "optimized_prompts.json",
-    config_path: str | None = None,
-    task_split: str | None = "validation",
-    tasks: list[str] | None = None,
-    eval_timeout: int = 600,
-    optimizer_temperature: float = 1.0,
-    agent_kwargs: dict | None = None,
-    verbose_llm: bool = False,
-    base_cache_dir: str = DSPY_CACHE_BASE,
-):
-    """Run DSPy optimization on ReAct agent prompts across multiple tasks and models.
+# ============================================================================
+# Phase Functions
+# ============================================================================
+
+
+def setup_optimization_run(
+    base_cache_dir: str,
+    optimizer_model: str | None,
+    eval_models: list[str],
+    verbose_llm: bool,
+    agent_config: dict,
+) -> OptimizationRunContext:
+    """Phase 1: Set up the optimization environment.
+
+    Creates run directory, configures DSPy LM, and sets up LLM logging.
 
     Args:
-        models: Model(s) to use for agent evaluation (can be single string or list)
-        optimizer_model: Model to use for DSPy optimization (defaults to first model)
-        optimizer_type: Which optimizer to use: "gepa", "mipro", or "bootstrap"
-        samples_per_task: Maximum number of samples to use per task
-        train_ratio: Ratio of data to use for training
-        num_candidates: Number of candidate prompts (for GEPA/MIPRO)
-        num_trials: Number of trials for MIPRO (defaults to DSPy's formula: max(2*num_vars*log2(N), 1.5*N))
-        max_bootstrapped_demos: Max bootstrapped demonstrations
-        max_labeled_demos: Max labeled demonstrations
-        output_file: Where to save the optimized prompts
-        config_path: Path to astabench config (default: uses astabench default)
-        task_split: Which split to use from config (default: "validation"). Mutually exclusive with tasks.
-        tasks: Specific task paths to use (e.g., ["astabench/sqa_dev"]). Mutually exclusive with task_split.
-        eval_timeout: Timeout in seconds for each sample evaluation
-        optimizer_temperature: Temperature for DSPy optimizer prompt generation
-        agent_kwargs: Additional keyword arguments to pass to the agent solver (e.g., {"max_steps": 10}).
-                     Defaults to {"max_steps": 10} for backward compatibility.
-        verbose_llm: If True, log all LLM calls during optimization to a timestamped file
-        base_cache_dir: Base directory for all caching (default: .dspy_cache)
-    """
-    if agent_kwargs is None:
-        agent_kwargs = {"max_steps": 10}
+        base_cache_dir: Base directory for caching
+        optimizer_model: Model to use for optimization (defaults to first eval model)
+        eval_models: List of evaluation models
+        verbose_llm: Whether to enable verbose LLM logging
+        agent_config: Agent configuration parameters
 
-    # Create run directory for this optimization run
+    Returns:
+        OptimizationRunContext with configured environment
+    """
     run_dir = create_run_directory(base_cache_dir)
 
     log_block(
@@ -567,83 +611,127 @@ def optimize_prompts(
         """,
     )
 
-    # Convert single model to list
-    if isinstance(models, str):
-        models = [models]
-
-    # Set up DSPy language model for generating candidate prompts
-    optimizer_model = optimizer_model or models[0]
+    optimizer_model = optimizer_model or eval_models[0]
     lm = dspy.LM(model=optimizer_model)
 
-    # Configure LLM call logging if requested
     if verbose_llm:
         llm_log_file = f"{run_dir}/llm_calls.log"
         llm_logger = LLMCallLogger(llm_log_file)
         dspy.settings.configure(lm=lm, callbacks=[llm_logger])
         logger.info(f"LLM call logging enabled: {llm_log_file}")
     else:
-        # Allow DSPy to use default parallelization (we use subprocesses for eval isolation)
         dspy.settings.configure(lm=lm)
 
-    logger.info(f"Agent models: {', '.join(models)}")
+    logger.info(f"Agent models: {', '.join(eval_models)}")
     logger.info(f"Optimizer model: {optimizer_model}")
-    logger.info("Loading tasks from config...")
     logger.info(
         "Running evaluations in parallel using subprocess isolation (bypasses inspect_ai limitation)"
     )
 
-    # Load task configs from astabench
-    task_configs = load_tasks_from_config(
-        config_path=config_path,
-        split=task_split,
-        task_paths=tasks,
+    return OptimizationRunContext(
+        run_dir=run_dir,
+        eval_models=eval_models,
+        optimizer_model=optimizer_model,
+        agent_config=agent_config,
     )
 
-    if tasks:
+
+def prepare_training_data(
+    task_config: TaskLoadingConfig,
+    run_context: OptimizationRunContext,
+    eval_timeout: int,
+) -> TrainingData:
+    """Phase 2: Load and prepare training data.
+
+    Loads tasks, samples, creates DSPy examples, and splits into train/val.
+
+    Args:
+        task_config: Configuration for task loading
+        run_context: Optimization run context (contains run_dir, eval_models, agent_config)
+        eval_timeout: Timeout in seconds for each sample evaluation
+
+    Returns:
+        TrainingData with prepared examples and metric function
+    """
+    logger.info("Loading tasks from config...")
+
+    task_configs = load_tasks_from_config(
+        config_path=task_config.config_path,
+        split=task_config.task_split,
+        task_paths=task_config.tasks,
+    )
+
+    if task_config.tasks:
         logger.info(f"Loaded {len(task_configs)} specified tasks")
     else:
-        logger.info(f"Loaded {len(task_configs)} tasks from {task_split} split")
+        logger.info(
+            f"Loaded {len(task_configs)} tasks from {task_config.task_split} split"
+        )
 
-    # Load samples from all tasks
     sample_tuples = load_samples_from_tasks(
         task_configs=task_configs,
-        samples_per_task=samples_per_task,
+        samples_per_task=task_config.samples_per_task,
     )
     logger.info(f"Loaded {len(sample_tuples)} total samples across all tasks")
 
-    # Create mixed DSPy examples and split into train/val
     train_examples, val_examples = create_mixed_dspy_examples(
         sample_tuples=sample_tuples,
-        train_ratio=train_ratio,
+        train_ratio=task_config.train_ratio,
     )
-
     logger.info(f"Using {len(train_examples)} train, {len(val_examples)} val examples")
 
-    # Create the DSPy module
-    react_prompts = DSPyReActPrompts()
-
-    # Create metric function that uses subprocess-based eval
     logger.info("Creating metric function (subprocess-based for parallelization)...")
-    eval_log_dir = f"{run_dir}/eval_logs"
+    eval_log_dir = f"{run_context.run_dir}/eval_logs"
     metric = create_metric_function(
-        models,
+        run_context.eval_models,
         eval_timeout=eval_timeout,
-        agent_kwargs=agent_kwargs,
+        agent_config=run_context.agent_config,
         eval_log_dir=eval_log_dir,
     )
 
-    # Set up optimizer based on type
-    logger.info(f"Setting up {optimizer_type} optimizer...")
+    return TrainingData(
+        task_configs=task_configs,
+        train_examples=train_examples,
+        val_examples=val_examples,
+        metric=metric,
+    )
 
-    # Initialize mipro_num_trials (only used for MIPRO)
-    mipro_num_trials = None
+
+def create_optimizer_setup(
+    optimizer_type: str,
+    training_data: TrainingData,
+    num_candidates: int,
+    num_trials: int | None,
+    max_bootstrapped_demos: int,
+    max_labeled_demos: int,
+    optimizer_temperature: float,
+    run_dir: str,
+) -> OptimizerSetup:
+    """Phase 3: Select and configure the optimizer.
+
+    Creates the appropriate optimizer and calculates compile kwargs.
+
+    Args:
+        optimizer_type: Type of optimizer ("gepa", "mipro", or "bootstrap")
+        training_data: Training data with examples and metric
+        num_candidates: Number of candidate prompts
+        num_trials: Number of trials (MIPRO only)
+        max_bootstrapped_demos: Max bootstrapped demonstrations
+        max_labeled_demos: Max labeled demonstrations
+        optimizer_temperature: Temperature for prompt generation
+        run_dir: Run directory for logs
+
+    Returns:
+        OptimizerSetup with configured optimizer and compile kwargs
+    """
+    logger.info(f"Setting up {optimizer_type} optimizer...")
 
     if optimizer_type == "gepa":
         try:
             from dspy.propose import GEPA
 
             optimizer = GEPA(
-                metric=metric,
+                metric=training_data.metric,
                 breadth=num_candidates,
                 depth=3,
                 init_temperature=optimizer_temperature,
@@ -655,38 +743,17 @@ def optimize_prompts(
             )
 
     elif optimizer_type == "mipro":
-        # MIPRO has two modes:
-        # 1. Auto mode: MIPROv2 decides num_candidates/num_trials
-        # 2. Manual mode (auto=None): must provide num_candidates and num_trials
-        # We use manual mode to allow user control
         optimizer = dspy.MIPROv2(
-            metric=metric,
-            auto=None,  # Enable manual mode
+            metric=training_data.metric,
+            auto=None,
             num_candidates=num_candidates,
             init_temperature=optimizer_temperature,
-            log_dir=run_dir,  # Save all candidate programs during optimization
+            log_dir=run_dir,
         )
         optimizer_name = "MIPROv2"
-        # Calculate num_trials for compile() call (MIPRO needs it there, not in __init__)
-        # Use DSPy's official formula: max(2 * num_vars * log₂(N), 1.5 * N)
-        # where num_vars = num_predictors * 2 for few-shot mode (bootstrap demos)
-        # Source: DSPy MIPROv2 documentation
-        if num_trials is None:
-            num_predictors = len(react_prompts.predictors())
-            num_vars = num_predictors * 2  # Assuming few-shot mode (bootstrap demos)
-            mipro_num_trials = int(
-                max(2 * num_vars * np.log2(num_candidates), 1.5 * num_candidates)
-            )
-        else:
-            mipro_num_trials = num_trials
-        logger.info(
-            f"Using manual mode with num_candidates={num_candidates}, num_trials={mipro_num_trials} (DSPy formula)"
-        )
 
     elif optimizer_type == "bootstrap":
-        # BootstrapFewShot: max_bootstrapped_demos and max_labeled_demos
-        # are passed to compile(), not __init__()
-        optimizer = dspy.BootstrapFewShot(metric=metric)
+        optimizer = dspy.BootstrapFewShot(metric=training_data.metric)
         optimizer_name = "BootstrapFewShot"
 
     else:
@@ -697,106 +764,171 @@ def optimize_prompts(
 
     logger.info(f"Using {optimizer_name} optimizer")
 
-    # Run optimization
-    # Interleave tasks to ensure MIPRO's dataset observation sees all task types
-    # MIPRO views first ~10 examples sequentially for dataset summarization
-    # Interleaving ensures all tasks appear in those first examples
+    # Prepare compile kwargs
+    compile_kwargs = {
+        "trainset": training_data.train_examples,
+        "max_bootstrapped_demos": max_bootstrapped_demos,
+        "max_labeled_demos": max_labeled_demos,
+    }
+
+    # MIPRO-specific configuration
+    if optimizer_type == "mipro":
+        if num_trials is None:
+            # Create a temporary DSPyReActPrompts to get predictor count
+            react_prompts = DSPyReActPrompts()
+            num_predictors = len(react_prompts.predictors())
+            num_vars = num_predictors * 2
+            mipro_num_trials = int(
+                max(2 * num_vars * np.log2(num_candidates), 1.5 * num_candidates)
+            )
+        else:
+            mipro_num_trials = num_trials
+
+        compile_kwargs["num_trials"] = mipro_num_trials
+
+        # Adaptive minibatch sizing
+        num_tasks = len(training_data.task_configs)
+        desired_minibatch = num_tasks * SAMPLES_PER_TASK_FOR_MINIBATCH
+        minibatch_size = min(
+            len(training_data.train_examples),
+            len(training_data.val_examples),
+            desired_minibatch,
+        )
+
+        compile_kwargs["minibatch_size"] = minibatch_size
+        compile_kwargs["minibatch"] = True
+
+        logger.info(
+            f"Using manual mode with num_candidates={num_candidates}, num_trials={mipro_num_trials} (DSPy formula)"
+        )
+        logger.info(
+            f"Minibatch size: {minibatch_size} "
+            f"(adaptive: min(train={len(training_data.train_examples)}, val={len(training_data.val_examples)}, "
+            f"{num_tasks} tasks × {SAMPLES_PER_TASK_FOR_MINIBATCH}))"
+        )
+
+        if len(training_data.val_examples) < desired_minibatch and len(
+            training_data.val_examples
+        ) < len(training_data.train_examples):
+            logger.warning(
+                f"Validation set size ({len(training_data.val_examples)}) is limiting minibatch size. "
+                f"Desired {desired_minibatch} samples "
+                f"({num_tasks} tasks × {SAMPLES_PER_TASK_FOR_MINIBATCH}) for multi-task coverage. "
+                f"Consider increasing --samples-per-task or adjusting train_ratio."
+            )
+
+        logger.info(f"Number of trials: {mipro_num_trials}")
+        logger.info(
+            f"Each trial will evaluate {minibatch_size} sample(s) on {len(compile_kwargs['trainset'])} model(s)"
+        )
+        logger.info(
+            f"Estimated total evaluations: ~{mipro_num_trials * minibatch_size}"
+        )
+
+    return OptimizerSetup(
+        optimizer=optimizer,
+        optimizer_name=optimizer_name,
+        compile_kwargs=compile_kwargs,
+    )
+
+
+def run_optimization_process(
+    optimizer_setup: OptimizerSetup,
+    training_data: TrainingData,
+    run_dir: str,
+) -> dspy.Module:
+    """Phase 4: Run the optimization process.
+
+    Executes optimizer.compile() with interleaved training data.
+
+    Args:
+        optimizer_setup: Configured optimizer and compile kwargs
+        training_data: Training data with examples
+        run_dir: Run directory
+
+    Returns:
+        Optimized DSPy module
+    """
     import random
 
-    rng = random.Random(42)  # Reproducible interleaving
-    train_examples_interleaved = interleave_tasks(train_examples, rng=rng)
+    rng = random.Random(42)
+    train_examples_interleaved = interleave_tasks(training_data.train_examples, rng=rng)
+
+    # Update trainset in compile_kwargs
+    compile_kwargs = optimizer_setup.compile_kwargs.copy()
+    compile_kwargs["trainset"] = train_examples_interleaved
 
     log_block(
         f"""
         STARTING DSPY OPTIMIZATION
 
-        Optimizer: {optimizer_name}
+        Optimizer: {optimizer_setup.optimizer_name}
         Training samples: {len(train_examples_interleaved)}
-        Models being optimized for: {', '.join(models)}
     """,
     )
 
-    # Prepare compile() arguments based on optimizer type
-    compile_kwargs = {
-        "trainset": train_examples_interleaved,
-        "max_bootstrapped_demos": max_bootstrapped_demos,
-        "max_labeled_demos": max_labeled_demos,
-    }
-
-    # MIPRO needs num_trials and minibatch settings in compile() call
-    if optimizer_type == "mipro":
-        compile_kwargs["num_trials"] = mipro_num_trials
-        # Adaptive minibatch sizing for multi-task optimization
-        # Ensure adequate coverage across all task types
-        # Must not exceed validation set size (DSPy internal requirement)
-        num_tasks = len(task_configs)
-        desired_minibatch = num_tasks * SAMPLES_PER_TASK_FOR_MINIBATCH
-        minibatch_size = min(
-            len(train_examples_interleaved), len(val_examples), desired_minibatch
-        )
-        compile_kwargs["minibatch_size"] = minibatch_size
-        compile_kwargs["minibatch"] = True
-        logger.info(
-            f"Minibatch size: {minibatch_size} "
-            f"(adaptive: min(train={len(train_examples_interleaved)}, val={len(val_examples)}, "
-            f"{num_tasks} tasks × {SAMPLES_PER_TASK_FOR_MINIBATCH}))"
-        )
-
-        # Warn if validation set size is limiting the adaptive sizing
-        if len(val_examples) < desired_minibatch and len(val_examples) < len(
-            train_examples_interleaved
-        ):
-            logger.warning(
-                f"Validation set size ({len(val_examples)}) is limiting minibatch size. "
-                f"Desired {desired_minibatch} samples "
-                f"({num_tasks} tasks × {SAMPLES_PER_TASK_FOR_MINIBATCH}) for multi-task coverage. "
-                f"Consider increasing --samples-per-task or adjusting train_ratio."
-            )
-        logger.info(f"Number of trials: {mipro_num_trials}")
-        logger.info(
-            f"Each trial will evaluate {minibatch_size} sample(s) on {len(models)} model(s)"
-        )
-        logger.info(
-            f"Estimated total evaluations: ~{mipro_num_trials * minibatch_size * len(models)}"
-        )
-
+    eval_log_dir = f"{run_dir}/eval_logs"
     logger.info("Detailed per-sample logs are being written to: %s", eval_log_dir)
     logger.info("Candidate programs will be saved to: %s/evaluated_programs/", run_dir)
 
-    optimized_module = optimizer.compile(react_prompts, **compile_kwargs)
+    # Create the prompts module to be optimized
+    react_prompts = DSPyReActPrompts()
+    optimized_module = optimizer_setup.optimizer.compile(
+        react_prompts, **compile_kwargs
+    )
 
     logger.info("OPTIMIZATION COMPLETE!")
 
-    # Generate optimized prompts
-    # Use generic task description since we want universal prompts for multi-task optimization
+    return optimized_module
+
+
+def save_and_evaluate_results(
+    optimized_module: dspy.Module,
+    output_file: str,
+    metadata: OptimizationMetadata,
+    run_context: OptimizationRunContext,
+    training_data: TrainingData,
+) -> dict:
+    """Phase 5: Save optimized prompts and evaluate results.
+
+    Generates final prompts, saves to file, and evaluates on validation set.
+
+    Args:
+        optimized_module: Optimized DSPy module
+        output_file: File path to save optimized prompts
+        metadata: Metadata about the optimization run
+        run_context: Optimization run context
+        training_data: Training data with examples and metric
+
+    Returns:
+        Dictionary of optimized prompts and metadata
+    """
     logger.info("\nGenerating optimized prompts...")
     optimized_prediction = optimized_module(
         task_description=GENERIC_TASK_DESCRIPTION,
         submit_function_name=DEFAULT_SUBMIT_NAME,
     )
 
-    # Collect task information for metadata
-    task_names = [config.name for config in task_configs]
-    task_paths = [config.path for config in task_configs]
+    task_names = [config.name for config in training_data.task_configs]
+    task_paths = [config.path for config in training_data.task_configs]
 
     optimized_prompts = {
         "system_message": optimized_prediction.system_message,
         "continue_message": optimized_prediction.continue_message,
         "metadata": {
-            "agent_models": models,
-            "optimizer_model": optimizer_model,
-            "train_samples": len(train_examples),
-            "val_samples": len(val_examples),
-            "optimizer": optimizer_name,
-            "num_candidates": num_candidates if optimizer_type != "bootstrap" else None,
+            "agent_models": run_context.eval_models,
+            "optimizer_model": run_context.optimizer_model,
+            "train_samples": len(training_data.train_examples),
+            "val_samples": len(training_data.val_examples),
+            "optimizer": metadata.optimizer_name,
+            "num_candidates": metadata.num_candidates,
             "tasks": task_names,
             "task_paths": task_paths,
-            "task_split": task_split,
-            "samples_per_task": samples_per_task,
+            "task_split": metadata.task_split,
+            "samples_per_task": metadata.samples_per_task,
         },
     }
 
-    # Save to file
     output_path = Path(__file__).parent / output_file
     with open(output_path, "w") as f:
         json.dump(optimized_prompts, f, indent=2)
@@ -807,17 +939,26 @@ def optimize_prompts(
         "📝 Optimized Continue Message: %s", optimized_prompts["continue_message"]
     )
 
-    # Evaluate on validation set
-    if val_examples:
+    if training_data.val_examples:
         logger.info("\n📊 Evaluating first validation example...")
-        val_score = metric(val_examples[0], optimized_prediction)
+        val_score = training_data.metric(
+            training_data.val_examples[0], optimized_prediction
+        )
         logger.info(f"✓ Validation score (first sample): {val_score:.4f}")
 
     logger.info(f"\n💡 Optimization Details:")
-    logger.info(f"   Agent models (for evaluation): {', '.join(models)}")
-    logger.info(f"   Optimizer model (for prompt generation): {optimizer_model}")
-    logger.info(f"   Tasks optimized: {len(task_configs)} tasks ({task_split} split)")
-    logger.info(f"   Total training samples: {len(train_examples)} across all tasks")
+    logger.info(
+        f"   Agent models (for evaluation): {', '.join(run_context.eval_models)}"
+    )
+    logger.info(
+        f"   Optimizer model (for prompt generation): {run_context.optimizer_model}"
+    )
+    logger.info(
+        f"   Tasks optimized: {len(training_data.task_configs)} tasks ({metadata.task_split} split)"
+    )
+    logger.info(
+        f"   Total training samples: {len(training_data.train_examples)} across all tasks"
+    )
 
     logger.info(f"\n✓ To use the optimized agent on any task, run:")
     logger.info(f"  uv run astabench eval <task_path> \\")
@@ -835,7 +976,7 @@ def optimize_prompts(
 
     log_block(
         f"""
-        ALL OUTPUTS SAVED TO: {run_dir}
+        ALL OUTPUTS SAVED TO: {run_context.run_dir}
 
         Run directory contents:
           - llm_calls.log (if --verbose-llm was used)
@@ -843,8 +984,132 @@ def optimize_prompts(
           - evaluated_programs/ (MIPRO candidate programs)
           - <inspect_ai_eval_outputs>
 
-        You can review this run's outputs anytime by examining: {run_dir}
+        You can review this run's outputs anytime by examining: {run_context.run_dir}
         """,
+    )
+
+    return optimized_prompts
+
+
+def optimize_prompts(
+    models: list[str] | str = "openai/gpt-4o",
+    optimizer_model: str | None = None,
+    optimizer_type: str = "mipro",
+    samples_per_task: int = 5,
+    train_ratio: float = 0.8,
+    num_candidates: int = 5,
+    num_trials: int | None = None,
+    max_bootstrapped_demos: int = 3,
+    max_labeled_demos: int = 3,
+    output_file: str = "optimized_prompts.json",
+    config_path: str | None = None,
+    task_split: str | None = "validation",
+    tasks: list[str] | None = None,
+    eval_timeout: int = 600,
+    optimizer_temperature: float = 1.0,
+    agent_config: dict | None = None,
+    verbose_llm: bool = False,
+    base_cache_dir: str = DSPY_CACHE_BASE,
+):
+    """Run DSPy optimization on ReAct agent prompts across multiple tasks and models.
+
+    This function orchestrates a 5-phase pipeline:
+    1. Environment Setup - Create run directory, configure DSPy LM, set up logging
+    2. Data Loading & Preparation - Load tasks, samples, create DSPy examples
+    3. Optimizer Selection & Configuration - Choose and configure optimizer
+    4. Optimization Execution - Run optimizer.compile() with prepared data
+    5. Results & Evaluation - Save prompts, evaluate on validation set
+
+    Args:
+        models: Model(s) to use for agent evaluation (can be single string or list)
+        optimizer_model: Model to use for DSPy optimization (defaults to first model)
+        optimizer_type: Which optimizer to use: "gepa", "mipro", or "bootstrap"
+        samples_per_task: Maximum number of samples to use per task
+        train_ratio: Ratio of data to use for training
+        num_candidates: Number of candidate prompts (for GEPA/MIPRO)
+        num_trials: Number of trials for MIPRO (defaults to DSPy's formula: max(2*num_vars*log2(N), 1.5*N))
+        max_bootstrapped_demos: Max bootstrapped demonstrations
+        max_labeled_demos: Max labeled demonstrations
+        output_file: Where to save the optimized prompts
+        config_path: Path to astabench config (default: uses astabench default)
+        task_split: Which split to use from config (default: "validation"). Mutually exclusive with tasks.
+        tasks: Specific task paths to use (e.g., ["astabench/sqa_dev"]). Mutually exclusive with task_split.
+        eval_timeout: Timeout in seconds for each sample evaluation
+        optimizer_temperature: Temperature for DSPy optimizer prompt generation
+        agent_config: Additional keyword arguments to pass to the agent solver (e.g., {"max_steps": 10}).
+                     Defaults to {"max_steps": 10} for backward compatibility.
+        verbose_llm: If True, log all LLM calls during optimization to a timestamped file
+        base_cache_dir: Base directory for all caching (default: .dspy_cache)
+
+    Returns:
+        Dictionary containing optimized prompts and metadata
+    """
+    if agent_config is None:
+        agent_config = {"max_steps": 10}
+
+    # Convert single model to list
+    if isinstance(models, str):
+        models = [models]
+
+    # Phase 1: Environment Setup
+    context = setup_optimization_run(
+        base_cache_dir=base_cache_dir,
+        optimizer_model=optimizer_model,
+        eval_models=models,
+        verbose_llm=verbose_llm,
+        agent_config=agent_config,
+    )
+
+    # Create configuration objects
+    task_config = TaskLoadingConfig(
+        config_path=config_path,
+        task_split=task_split,
+        tasks=tasks,
+        samples_per_task=samples_per_task,
+        train_ratio=train_ratio,
+    )
+
+    # Phase 2: Data Loading & Preparation
+    data = prepare_training_data(
+        task_config=task_config,
+        run_context=context,
+        eval_timeout=eval_timeout,
+    )
+
+    # Phase 3: Optimizer Selection & Configuration
+    optimizer_setup = create_optimizer_setup(
+        optimizer_type=optimizer_type,
+        training_data=data,
+        num_candidates=num_candidates,
+        num_trials=num_trials,
+        max_bootstrapped_demos=max_bootstrapped_demos,
+        max_labeled_demos=max_labeled_demos,
+        optimizer_temperature=optimizer_temperature,
+        run_dir=context.run_dir,
+    )
+
+    # Phase 4: Optimization Execution
+    optimized_module = run_optimization_process(
+        optimizer_setup=optimizer_setup,
+        training_data=data,
+        run_dir=context.run_dir,
+    )
+
+    # Create metadata for Phase 5
+    metadata = OptimizationMetadata(
+        optimizer_name=optimizer_setup.optimizer_name,
+        num_candidates=num_candidates if optimizer_type != "bootstrap" else None,
+        task_split=task_split,
+        samples_per_task=samples_per_task,
+    )
+
+    # Phase 5: Results & Evaluation
+    optimized_prompts = save_and_evaluate_results(
+        optimized_module=optimized_module,
+        output_file=output_file,
+        metadata=metadata,
+        run_context=context,
+        training_data=data,
     )
 
     return optimized_prompts
@@ -962,8 +1227,8 @@ if __name__ == "__main__":
     # Set task_split to None if using --tasks
     task_split = None if tasks else args.task_split
 
-    # Build agent_kwargs from CLI arguments
-    agent_kwargs = {"max_steps": args.agent_max_steps}
+    # Build agent_config from CLI arguments
+    agent_config = {"max_steps": args.agent_max_steps}
 
     optimize_prompts(
         models=models,
@@ -979,6 +1244,6 @@ if __name__ == "__main__":
         tasks=tasks,
         eval_timeout=args.eval_timeout,
         optimizer_temperature=args.optimizer_temperature,
-        agent_kwargs=agent_kwargs,
+        agent_config=agent_config,
         verbose_llm=args.verbose_llm,
     )
