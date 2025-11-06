@@ -128,6 +128,10 @@ def _do_evaluation(
 
         # Run eval on this sample with this model
         # inspect_eval can load tasks by path string (e.g., "astabench/sqa_dev")
+        #
+        # Retry configuration: We allow up to 2 retries to handle transient failures
+        # (e.g., scorer crashes due to unexpected agent output, temporary API issues).
+        # This reduces spurious failures without hiding systemic problems.
         logs = inspect_eval(
             tasks=task_path,  # Pass task path as string
             model=model_name,
@@ -136,6 +140,7 @@ def _do_evaluation(
             log_dir=".dspy_cache",
             log_level="warning",
             display="plain",
+            retry_on_error=2,  # Retry up to 2 times before failing
         )
 
         # Extract score from results
@@ -143,14 +148,43 @@ def _do_evaluation(
         eval_log = logs[0]
 
         # Handle evaluation failures gracefully
+        #
+        # Design decision: We return 0.0 instead of crashing the entire optimization.
+        # Rationale:
+        # 1. A bad prompt can cause systemic failures across samples (e.g., malformed
+        #    output that breaks the scorer). Crashing loses all optimization progress.
+        # 2. Scoring 0.0 signals DSPy to avoid this prompt in future iterations.
+        # 3. Infrastructure bugs would cause ALL samples to score 0.0, making it
+        #    obvious in the optimization results (not a silent failure).
+        # 4. Prompt-specific failures mean it's a bad prompt we want to avoid anyway.
         if not eval_log.results or not eval_log.results.scores:
-            error_msg = (
-                f"Evaluation failed for sample {sample_id} on model {model_name}"
-            )
+            error_context = {
+                "sample_id": sample_id,
+                "task_path": task_path,
+                "model": model_name,
+                "system_message_preview": (
+                    system_message[:100] + "..."
+                    if len(system_message) > 100
+                    else system_message
+                ),
+                "continue_message_preview": (
+                    continue_message[:100] + "..."
+                    if len(continue_message) > 100
+                    else continue_message
+                ),
+            }
             if eval_log.error:
-                error_msg += f": {eval_log.error}"
-            print(f"WARNING: {error_msg}", file=sys.stderr)
-            print(f"Treating as score 0.0 for this model", file=sys.stderr)
+                logger.error(
+                    f"Evaluation failed for sample {sample_id} on model {model_name}: {eval_log.error}\n"
+                    f"Context: {error_context}\n"
+                    f"Returning score 0.0 for this model (will penalize this prompt in DSPy optimization)"
+                )
+            else:
+                logger.error(
+                    f"Evaluation returned no results/scores for sample {sample_id} on model {model_name}\n"
+                    f"Context: {error_context}\n"
+                    f"Returning score 0.0 for this model (will penalize this prompt in DSPy optimization)"
+                )
             scores.append(0.0)
             continue
 
@@ -162,19 +196,46 @@ def _do_evaluation(
                 break
 
         if not scorer:
-            print(
-                f"WARNING: Scorer '{scorer_name}' not found in results for {sample_id}. "
-                f"Available: {[s.name for s in eval_log.results.scores]}. Treating as 0.0.",
-                file=sys.stderr,
+            error_context = {
+                "sample_id": sample_id,
+                "task_path": task_path,
+                "model": model_name,
+                "requested_scorer": scorer_name,
+                "available_scorers": [s.name for s in eval_log.results.scores],
+                "system_message_preview": (
+                    system_message[:100] + "..."
+                    if len(system_message) > 100
+                    else system_message
+                ),
+            }
+            logger.error(
+                f"Scorer '{scorer_name}' not found in results for sample {sample_id} on model {model_name}\n"
+                f"Context: {error_context}\n"
+                f"This likely indicates a configuration error (wrong scorer name) or scorer initialization failure.\n"
+                f"Returning score 0.0 for this model (will penalize this prompt in DSPy optimization)"
             )
             scores.append(0.0)
             continue
 
         if metric_name not in scorer.metrics:
-            print(
-                f"WARNING: Metric '{metric_name}' not found in scorer '{scorer_name}' for {sample_id}. "
-                f"Available: {list(scorer.metrics.keys())}. Treating as 0.0.",
-                file=sys.stderr,
+            error_context = {
+                "sample_id": sample_id,
+                "task_path": task_path,
+                "model": model_name,
+                "scorer_name": scorer_name,
+                "requested_metric": metric_name,
+                "available_metrics": list(scorer.metrics.keys()),
+                "system_message_preview": (
+                    system_message[:100] + "..."
+                    if len(system_message) > 100
+                    else system_message
+                ),
+            }
+            logger.error(
+                f"Metric '{metric_name}' not found in scorer '{scorer_name}' for sample {sample_id} on model {model_name}\n"
+                f"Context: {error_context}\n"
+                f"This likely indicates a configuration error (wrong metric name) or metric computation failure.\n"
+                f"Returning score 0.0 for this model (will penalize this prompt in DSPy optimization)"
             )
             scores.append(0.0)
             continue
@@ -233,12 +294,19 @@ def _run_eval_worker(args):
             )
         except Exception as e:
             # Return exception info
+            #
+            # Note: This captures exceptions that occur during evaluation setup or execution.
+            # These are returned as error results rather than raised, so the parent process
+            # can decide how to handle them (e.g., return 0.0 during DSPy optimization).
             import traceback
 
             error_msg = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
-            print(
-                f"Exception in eval worker for sample {sample_id}: {error_msg}",
-                file=sys.stderr,
+            logger.error(
+                f"Exception in eval worker for sample {sample_id} on task {task_path}\n"
+                f"Error details: {error_msg}\n"
+                f"System message preview: {system_message[:100]}...\n"
+                f"Continue message preview: {continue_message[:100]}...\n"
+                f"This error occurred after any retries (if configured) were exhausted."
             )
             return ("error", error_msg)
 
