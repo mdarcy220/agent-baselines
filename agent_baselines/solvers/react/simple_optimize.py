@@ -157,24 +157,19 @@ class ReactInspectAgent:
             Returns:
                 Score averaged across all evaluation models
             """
-            # Extract prompts from prediction
             system_message = prediction.system_message
             continue_message = prediction.continue_message
 
-            # Extract metadata from example
             sample_id = example.sample_id
             task_path = example.task_path
             primary_metric = example.primary_metric
 
-            # Formulate agent_params dict with all parameters for the ReAct agent
-            # This includes the optimized prompts and any fixed agent kwargs
             agent_params = {
                 "system_message": system_message,
                 "continue_message": continue_message,
-                **self.config.agent_kwargs,  # Merge in fixed kwargs (e.g., max_steps)
+                **self.config.agent_kwargs,
             }
 
-            # Create log file path for this evaluation
             std_log_file = None
             if self.config.log_dir:
                 os.makedirs(self.config.log_dir, exist_ok=True)
@@ -262,12 +257,10 @@ class LLMCallLogger(BaseCallback):
         self.log_file = log_file
         self.call_count = 0
 
-        # Create log directory
         log_dir = os.path.dirname(log_file)
         if log_dir:
             os.makedirs(log_dir, exist_ok=True)
 
-        # Initialize log file
         with open(log_file, "w") as f:
             f.write(f"DSPy LLM Call Log - {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write("=" * 80 + "\n\n")
@@ -357,7 +350,6 @@ def setup_optimization_run(
     Returns:
         run_dir: Path to the run directory
     """
-    # Create run directory
     run_dir = run_config.run_dir
     if run_dir is None:
         timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -366,7 +358,6 @@ def setup_optimization_run(
 
     logger.info(f"Run directory: {run_dir}")
 
-    # Configure DSPy
     optimizer_model = optimizer_config.optimizer_model or agent_config.eval_models[0]
     setup_dspy_with_logging(optimizer_model, run_dir, run_config.verbose_llm)
 
@@ -384,7 +375,6 @@ def load_and_prepare_data(
     Returns:
         Tuple of (train_examples, val_examples, task_configs)
     """
-    # Load task configurations
     task_configs = load_tasks_from_config(
         config_path=task_config.config_path,
         split=task_config.task_split,
@@ -395,13 +385,11 @@ def load_and_prepare_data(
         f"Loading {len(task_configs)} tasks: {', '.join(tc.name for tc in task_configs)}"
     )
 
-    # Load samples from tasks
     sample_tuples = load_samples_from_tasks(
         task_configs=task_configs,
         samples_per_task=task_config.samples_per_task,
     )
 
-    # Create DSPy examples and split train/val
     train_examples, val_examples = create_mixed_dspy_examples(
         sample_tuples=sample_tuples,
         train_ratio=task_config.train_ratio,
@@ -434,17 +422,14 @@ def run_optimization(
     Returns:
         Tuple of (optimized_module, optimizer_name)
     """
-    # Create metric function (with logging for visibility)
     metric = agent_wrapper.create_logging_metric()
 
-    # Prepare common compile kwargs
     compile_kwargs = {
         "trainset": train_examples,
         "max_bootstrapped_demos": optimizer_config.max_bootstrapped_demos,
         "max_labeled_demos": optimizer_config.max_labeled_demos,
     }
 
-    # Create optimizer and add optimizer-specific kwargs
     optimizer_type = optimizer_config.optimizer_type
 
     if optimizer_type == "gepa":
@@ -522,10 +507,7 @@ def run_optimization(
         f"Starting {optimizer_name} optimization with {len(train_examples)} train samples..."
     )
 
-    # Get the DSPy module to optimize from agent wrapper
     react_prompts = agent_wrapper.get_tunable_module()
-
-    # Run optimization
     optimized_module = optimizer.compile(react_prompts, **compile_kwargs)
 
     logger.info("Optimization complete")
@@ -557,18 +539,13 @@ def optimize_react_prompts(
     Returns:
         Dictionary with optimized prompts and metadata
     """
-    # Setup
     run_dir = setup_optimization_run(optimizer_config, agent_config, run_config)
-
-    # Load data
     train_examples, val_examples, task_configs = load_and_prepare_data(task_config)
 
-    # Create agent wrapper
     agent_config.log_dir = f"{run_dir}/eval_logs"
     agent_wrapper = ReactInspectAgent(agent_config)
     logger.info(f"Agent config: {json.dumps(asdict(agent_config))}")
 
-    # Run optimization
     optimized_module, optimizer_name = run_optimization(
         agent_wrapper=agent_wrapper,
         train_examples=train_examples,
@@ -578,16 +555,13 @@ def optimize_react_prompts(
         run_dir=run_dir,
     )
 
-    # Generate final optimized prompts
     optimized_prediction = optimized_module(
         task_description=GENERIC_TASK_DESCRIPTION,
         submit_function_name=DEFAULT_SUBMIT_NAME,
     )
 
-    # Determine optimizer model for metadata
     optimizer_model = optimizer_config.optimizer_model or agent_config.eval_models[0]
 
-    # Package results
     optimized_prompts = {
         "system_message": optimized_prediction.system_message,
         "continue_message": optimized_prediction.continue_message,
@@ -609,14 +583,12 @@ def optimize_react_prompts(
         },
     }
 
-    # Save to file
     output_path = Path(__file__).parent / run_config.output_file
     with open(output_path, "w") as f:
         json.dump(optimized_prompts, f, indent=2)
 
     logger.info(f"Saved optimized prompts to: {output_path}")
 
-    # Validate on first val example
     if val_examples:
         metric = agent_wrapper.create_logging_metric()
         val_score = metric(val_examples[0], optimized_prediction)
@@ -747,19 +719,15 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # Validate mutually exclusive args
     if args.task_split != "validation" and args.tasks:
         parser.error("Cannot specify both --task-split and --tasks")
 
-    # Parse comma-separated lists
     models = [m.strip() for m in args.models.split(",")]
     tasks = [t.strip() for t in args.tasks.split(",")] if args.tasks else None
     task_split = None if tasks else args.task_split
 
-    # Build agent_kwargs
     agent_kwargs = {"max_steps": args.agent_max_steps}
 
-    # Parse config objects from CLI args
     task_config = TaskLoadingConfig(
         config_path=args.config_path,
         task_split=task_split,
@@ -791,7 +759,6 @@ if __name__ == "__main__":
         verbose_llm=args.verbose_llm,
     )
 
-    # Call with configs
     optimize_react_prompts(
         task_config=task_config,
         agent_config=agent_config,

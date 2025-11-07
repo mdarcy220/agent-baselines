@@ -121,7 +121,6 @@ def _do_evaluation(
     system_message = agent_params["system_message"]
     continue_message = agent_params["continue_message"]
 
-    # Additional kwargs (everything except system_message and continue_message)
     agent_kwargs = {
         k: v
         for k, v in agent_params.items()
@@ -135,29 +134,24 @@ def _do_evaluation(
         **agent_kwargs,
     )
 
-    # Evaluate on all models and collect scores
     scores = []
     for model_name in model_names:
         print(f"Evaluating sample {sample_id} on model {model_name}", file=sys.stderr)
 
-        # Run eval on this sample with this model
-        # inspect_eval can load tasks by path string (e.g., "astabench/sqa_dev")
-        #
         # Retry configuration: We allow up to 2 retries to handle transient failures
         # (e.g., scorer crashes due to unexpected agent output, temporary API issues).
         # This reduces spurious failures without hiding systemic problems.
         logs = inspect_eval(
-            tasks=task_path,  # Pass task path as string
+            tasks=task_path,
             model=model_name,
             solver=agent_solver,
             sample_id=sample_id,
             log_dir=".dspy_cache",
             log_level="warning",
             display="plain",
-            retry_on_error=2,  # Retry up to 2 times before failing
+            retry_on_error=2,
         )
 
-        # Extract score from results
         assert logs and len(logs) > 0, f"No logs returned for sample {sample_id}"
         eval_log = logs[0]
 
@@ -210,7 +204,6 @@ def _do_evaluation(
         scores.append(score_value)
         print(f"Model {model_name} score: {score_value:.4f}", file=sys.stderr)
 
-    # Average scores across models
     if not scores:
         error_msg = (
             f"All {len(model_names)} models failed for sample {sample_id} on task {task_path}. "
@@ -356,7 +349,6 @@ def eval_in_subprocess(
                 f"Subprocess failed for sample {sample_id} after {time.perf_counter() - subprocess_start:.1f}s: {e}"
             )
 
-    # Parse result
     status, *result = result_data
 
     if status == "error":
