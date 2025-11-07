@@ -160,10 +160,21 @@ def create_mixed_dspy_examples(
     Returns:
         Tuple of (train_examples, val_examples)
     """
-    # Split into train/val
-    split_idx = int(len(sample_tuples) * train_ratio)
-    train_tuples = sample_tuples[:split_idx]
-    val_tuples = sample_tuples[split_idx:]
+    # Group samples by task to ensure each task contributes to both train and val
+    by_task = {}
+    for task_path, primary_metric, task_name, sample in sample_tuples:
+        by_task.setdefault(task_name, []).append(
+            (task_path, primary_metric, task_name, sample)
+        )
+
+    # Split each task into train/val
+    train_tuples = []
+    val_tuples = []
+    for task_name in sorted(by_task.keys()):
+        task_samples = by_task[task_name]
+        split_idx = int(len(task_samples) * train_ratio)
+        train_tuples.extend(task_samples[:split_idx])
+        val_tuples.extend(task_samples[split_idx:])
 
     logger.info(
         f"Creating DSPy examples: {len(train_tuples)} train, {len(val_tuples)} val"
