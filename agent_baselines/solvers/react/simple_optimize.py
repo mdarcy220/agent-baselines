@@ -38,11 +38,6 @@ from agent_baselines.solvers.react.task_loader import (
 )
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
 
 # Generic task description for universal prompts (multi-task optimization)
 GENERIC_TASK_DESCRIPTION = """You will be given a task to complete. Use the available tools to help you solve the task, doing reasoning before each action to explain your approach."""
@@ -353,7 +348,20 @@ def setup_optimization_run(
     os.makedirs(run_config.run_dir, exist_ok=True)
     os.makedirs(agent_config.log_dir, exist_ok=True)
 
+    # Configure logging to console and file
+    log_file = f"{run_config.run_dir}/optimization.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(log_file),
+        ],
+    )
+
     logger.info(f"Run directory: {run_config.run_dir}")
+    logger.info(f"Log file: {log_file}")
 
     optimizer_model = optimizer_config.optimizer_model or agent_config.eval_models[0]
     setup_dspy_with_logging(
