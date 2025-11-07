@@ -204,6 +204,14 @@ class ReactInspectAgent:
 
         return logging_metric
 
+    def get_tunable_module(self) -> DSPyReActPrompts:
+        """Get the DSPy module with tunable parameters.
+
+        For ReAct agent, this is the DSPyReActPrompts module with
+        system_message_generator and continue_message_generator.
+        """
+        return DSPyReActPrompts()
+
 
 # ============================================================================
 # Optimizer Configuration
@@ -268,6 +276,7 @@ def create_optimizer(
 
 def calculate_compile_kwargs(
     optimizer_type: str,
+    agent_wrapper: ReactInspectAgent,
     train_examples: list,
     val_examples: list,
     num_tasks: int,
@@ -283,6 +292,7 @@ def calculate_compile_kwargs(
 
     Args:
         optimizer_type: Type of optimizer
+        agent_wrapper: Agent wrapper providing tunable module
         train_examples: Training examples
         val_examples: Validation examples
         num_tasks: Number of tasks being optimized
@@ -305,10 +315,8 @@ def calculate_compile_kwargs(
         # Formula: max(2 * num_vars * log2(N), 1.5 * N)
         # where num_vars = num_predictors * 2 (system + continue message)
         if num_trials is None:
-            # Create temporary module to count predictors
-            # NOTE: This creates a second instance (first is in optimization phase)
-            # but is necessary to calculate trials before optimization starts
-            react_prompts = DSPyReActPrompts()
+            # Get module from agent wrapper to count predictors
+            react_prompts = agent_wrapper.get_tunable_module()
             num_predictors = len(react_prompts.predictors())
             num_vars = num_predictors * 2
             num_trials = int(
@@ -320,15 +328,13 @@ def calculate_compile_kwargs(
         # Calculate adaptive minibatch size
         # Ensures adequate coverage across all tasks during optimization
         desired_minibatch = num_tasks * SAMPLES_PER_TASK_FOR_MINIBATCH
-        minibatch_size = min(len(train_examples), len(val_examples), desired_minibatch)
-
-        compile_kwargs["minibatch_size"] = minibatch_size
+        compile_kwargs["minibatch_size"] = min(len(train_examples), len(val_examples), desired_minibatch)
         compile_kwargs["minibatch"] = True
 
         # Log configuration
         logger.info(f"MIPRO num_trials: {num_trials} (DSPy formula)")
         logger.info(
-            f"MIPRO minibatch_size: {minibatch_size} "
+            f"MIPRO minibatch_size: {compile_kwargs['minibatch_size']} "
             f"(min of train={len(train_examples)}, val={len(val_examples)}, "
             f"desired={desired_minibatch} [{num_tasks} tasks × {SAMPLES_PER_TASK_FOR_MINIBATCH}])"
         )
@@ -515,7 +521,7 @@ def optimize_react_prompts(
 
     # Default configurations
     if agent_kwargs is None:
-        agent_kwargs = {"max_steps": 10}
+        agent_kwargs = {}
 
     # Normalize eval_models to list
     if isinstance(eval_models, str):
@@ -627,6 +633,7 @@ def optimize_react_prompts(
 
     compile_kwargs = calculate_compile_kwargs(
         optimizer_type=optimizer_type,
+        agent_wrapper=agent_wrapper,
         train_examples=train_examples,
         val_examples=val_examples,
         num_tasks=len(task_configs),
@@ -650,8 +657,8 @@ def optimize_react_prompts(
     logger.info(f"Validation samples: {len(val_examples)}")
     logger.info("Starting DSPy optimizer.compile()...")
 
-    # Create the DSPy module to optimize
-    react_prompts = DSPyReActPrompts()
+    # Get the DSPy module to optimize from agent wrapper
+    react_prompts = agent_wrapper.get_tunable_module()
 
     # Run optimization
     optimized_module = optimizer.compile(react_prompts, **compile_kwargs)
