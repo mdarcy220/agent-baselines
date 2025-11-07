@@ -1,27 +1,25 @@
-"""Simplified DSPy optimizer for ReAct agent prompts.
+"""DSPy optimization pipeline for ReAct agent prompts.
 
-Clean architecture with clear separation of concerns:
+Architecture:
 1. Task Data - Load and prepare samples from multiple tasks
-2. Agent Wrapper - Encapsulate tunable params, fixed params, and metric
+2. ReactInspectAgent - dspy.Module with forward() and metric() methods
 3. Optimizer - Configure DSPy optimizer (MIPRO, GEPA, Bootstrap)
-4. Logging - Optional infrastructure for debugging
-5. CLI - Wire everything together
+4. CLI - Wire everything together
 
-Key design principles:
-- Import data loading utilities from task_loader.py
-- Use parallel_eval.py for subprocess-based evaluation
-- Keep metric function pure (no filesystem I/O)
-- Separate logging concerns from evaluation logic
-- Make it easy to extend to other agents beyond ReAct
+Notes:
+- forward() runs eval_in_subprocess() and caches results
+- metric() extracts scores from cached eval files
+- Signature instructions are the tunable parameters
 
-How it works:
-1. DSPy signature instructions define the agent prompts (seeded from basic_agent defaults)
-2. DSPy optimizers propose variations to the signature instructions
-3. For each variation, the metric function evaluates agent performance
-4. Optimizers keep the instructions that lead to best performance
-5. After optimization, extract the optimized instructions as final prompts
+Optimization Flow:
+1. DSPy optimizer calls agent.forward() → runs eval, caches result
+2. DSPy optimizer calls agent.metric() → extracts score from cache
+3. Optimizer modifies signature instructions based on scores
+4. After optimization, extract optimized instructions as final prompts
 
-This design makes it straightforward to extend to other inspect_ai agents.
+Extension Pattern:
+To optimize a different agent, create a new dspy.Module subclass with
+custom forward() and metric() methods.
 """
 
 import json
@@ -30,16 +28,15 @@ import os
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import dspy
 import numpy as np
 from dspy.utils.callback import BaseCallback
 
-from agent_baselines.solvers.react.basic_agent import DEFAULT_SUBMIT_NAME
 from agent_baselines.solvers.react.dspy_agent import (
-    DSPyReActPrompts,
-    extract_score_from_eval,
+    ReactAgentConfig,
+    ReactInspectAgent,
 )
 from agent_baselines.solvers.react.task_loader import (
     create_mixed_dspy_examples,
@@ -93,150 +90,6 @@ class RunConfig:
     output_file: str
     verbose_llm: bool
     base_dir: str = ".dspy_cache"
-
-
-@dataclass
-class ReactAgentConfig:
-    """Encapsulates configuration for ReAct agent wrapper.
-
-    This separates tunable parameters (what DSPy optimizes) from fixed
-    parameters (what stays constant during optimization).
-    """
-
-    # Fixed parameters (not optimized)
-    eval_models: list[str]  # Models to evaluate prompts on
-    agent_kwargs: dict  # Agent config (e.g., {"max_steps": 10})
-    eval_timeout: int  # Timeout per sample evaluation
-    log_dir: str  # Directory for evaluation logs
-
-
-class ReactInspectAgent:
-    """Agent wrapper that bridges DSPy and inspect_ai.
-
-    This abstraction encapsulates:
-    1. Tunable parameters - what DSPy optimizes (system/continue messages)
-    2. Fixed parameters - what stays constant (models, agent config)
-    3. Metric function - extracts scores from cached eval results
-
-    The evaluation flow:
-    - DSPyReActPrompts.forward() runs agent evals and caches results
-    - Metric function extracts scores from the cached eval files
-    """
-
-    # Solver path for ReAct agent with DSPy-optimizable prompts
-    solver_path = (
-        "agent_baselines/solvers/react/dspy_agent.py@create_agent_with_dspy_prompts"
-    )
-
-    def __init__(self, config: ReactAgentConfig):
-        """Initialize agent wrapper with fixed configuration.
-
-        Args:
-            config: Fixed agent configuration (models, timeouts, etc.)
-        """
-        self.config = config
-
-    def create_metric(self) -> Callable:
-        """Create metric function for DSPy optimization.
-
-        Returns a function that extracts scores from cached eval files.
-
-        The flow is:
-        1. DSPy optimizer calls forward() which runs eval_in_subprocess() and caches result
-        2. DSPy optimizer calls this metric with the prediction from forward()
-        3. Metric extracts the score from the cached eval file
-
-        The metric assumes forward() always caches eval results in prediction.eval_path.
-        """
-
-        def metric(example, prediction, trace=None, pred_name=None, pred_trace=None):
-            """Metric function for DSPy optimization that extracts cached eval scores.
-
-            DSPy optimizers call forward() to get prompts, then call this metric to score
-            them. Since forward() always runs eval_in_subprocess() and caches the result
-            in prediction.eval_path, this function simply extracts the score from that
-            cached eval file.
-
-            Args:
-                example: DSPy Example with sample_id, task_path, primary_metric
-                prediction: DSPy Prediction with eval_path (cached result from forward())
-                trace: Optional trace (unused)
-                pred_name: Optional predictor name (DSPy internal)
-                pred_trace: Optional predictor trace (DSPy internal)
-
-            Returns:
-                Score extracted from cached eval file
-
-            Raises:
-                ValueError: If eval_path is missing or score extraction fails
-            """
-            sample_id = example.sample_id
-            primary_metric = example.primary_metric
-
-            # Extract score from cached .eval file
-            # forward() always caches eval results, so eval_path should always be present
-            if not hasattr(prediction, "eval_path") or not prediction.eval_path:
-                raise ValueError(
-                    f"Missing eval_path in prediction for sample {sample_id}. "
-                    f"forward() should have cached the eval result."
-                )
-
-            logger.info(
-                f"Extracting score for {sample_id} from cached eval: {prediction.eval_path}"
-            )
-            score_value = extract_score_from_eval(prediction.eval_path, primary_metric)
-            return score_value
-
-        return metric
-
-    def create_logging_metric(self) -> Callable:
-        """Create metric function with logging wrapper.
-
-        This wraps the pure metric with logging behavior for user visibility.
-        Only used when log_dir is configured.
-
-        Returns:
-            Metric function that logs progress and results
-        """
-        base_metric = self.create_metric()
-
-        def logging_metric(
-            example, prediction, trace=None, pred_name=None, pred_trace=None
-        ):
-            """Metric with logging for visibility during optimization."""
-            sample_id = example.sample_id
-            task_name = example.task_name
-
-            try:
-                # Call base metric for evaluation
-                score_value = base_metric(
-                    example, prediction, trace, pred_name, pred_trace
-                )
-
-                # Log result concisely
-                logger.info(f"✓ {sample_id} ({task_name}): {score_value:.4f}")
-                return score_value
-
-            except Exception as e:
-                # Log failure
-                logger.info(f"✗ {sample_id} ({task_name}): {e}")
-                raise
-
-        return logging_metric
-
-    def get_tunable_module(self) -> DSPyReActPrompts:
-        """Get the DSPy module with tunable parameters.
-
-        Returns the DSPyReActPrompts module with optimizable signature instructions,
-        configured to run actual evals during forward() for bootstrap support.
-        """
-        return DSPyReActPrompts(
-            eval_models=self.config.eval_models,
-            agent_kwargs=self.config.agent_kwargs,
-            eval_timeout=self.config.eval_timeout,
-            log_dir=self.config.log_dir,
-            solver_path=self.solver_path,
-        )
 
 
 # ============================================================================
@@ -434,7 +287,7 @@ def load_and_prepare_data(
 
 
 def run_optimization(
-    agent_wrapper: ReactInspectAgent,
+    agent: ReactInspectAgent,
     train_examples: list,
     val_examples: list,
     optimizer_config: OptimizerConfig,
@@ -443,10 +296,18 @@ def run_optimization(
 ) -> tuple[Any, str]:
     """Configure optimizer and run optimization.
 
+    Args:
+        agent: ReactInspectAgent module (dspy.Module subclass)
+        train_examples: Training examples
+        val_examples: Validation examples
+        optimizer_config: Optimizer configuration
+        num_tasks: Number of tasks
+        run_dir: Run directory
+
     Returns:
-        Tuple of (optimized_module, optimizer_name)
+        Tuple of (optimized_agent, optimizer_name)
     """
-    metric = agent_wrapper.create_logging_metric()
+    metric = agent.logging_metric
 
     compile_kwargs = {
         "trainset": train_examples,
@@ -492,8 +353,7 @@ def run_optimization(
         # where num_vars = num_predictors * 2 (system + continue message)
         num_trials = optimizer_config.num_trials
         if num_trials is None:
-            react_prompts = agent_wrapper.get_tunable_module()
-            num_predictors = len(react_prompts.predictors())
+            num_predictors = len(agent.predictors())
             num_vars = num_predictors * 2
             num_trials = int(
                 max(
@@ -541,12 +401,11 @@ def run_optimization(
         f"Starting {optimizer_name} optimization with {len(train_examples)} train samples..."
     )
 
-    react_prompts = agent_wrapper.get_tunable_module()
-    optimized_module = optimizer.compile(react_prompts, **compile_kwargs)
+    optimized_agent = optimizer.compile(agent, **compile_kwargs)
 
     logger.info("Optimization complete")
 
-    return optimized_module, optimizer_name
+    return optimized_agent, optimizer_name
 
 
 # ============================================================================
@@ -566,7 +425,7 @@ def optimize_react_prompts(
 
     Args:
         task_config: Configuration for loading task data
-        agent_config: Configuration for ReAct agent wrapper
+        agent_config: Configuration for ReactInspectAgent
         optimizer_config: Configuration for DSPy optimizer
         run_config: Runtime configuration
 
@@ -576,11 +435,11 @@ def optimize_react_prompts(
     setup_optimization_run(optimizer_config, agent_config, run_config)
     train_examples, val_examples, task_configs = load_and_prepare_data(task_config)
 
-    agent_wrapper = ReactInspectAgent(agent_config)
+    agent = ReactInspectAgent(agent_config)
     logger.info(f"Agent config: {json.dumps(asdict(agent_config))}")
 
-    optimized_module, optimizer_name = run_optimization(
-        agent_wrapper=agent_wrapper,
+    optimized_agent, optimizer_name = run_optimization(
+        agent=agent,
         train_examples=train_examples,
         val_examples=val_examples,
         optimizer_config=optimizer_config,
@@ -589,13 +448,11 @@ def optimize_react_prompts(
     )
 
     # Extract optimized prompts
-    # After optimization, the module's forward() method returns the optimized
+    # After optimization, the agent's forward() method returns the optimized
     # signature instructions, which become our final agent prompts
     # Note: We don't pass sample data here, so forward() just returns the prompts
     # without running any evals (sample_id, task_path, primary_metric are optional)
-    optimized_prediction = optimized_module(
-        submit_function_name=DEFAULT_SUBMIT_NAME,
-    )
+    optimized_prediction = optimized_agent()
 
     optimizer_model = optimizer_config.optimizer_model or agent_config.eval_models[0]
 
@@ -642,8 +499,7 @@ def optimize_react_prompts(
     logger.info(f"Saved sample IDs to: {sample_ids_file}")
 
     if val_examples:
-        metric = agent_wrapper.create_logging_metric()
-        val_score = metric(val_examples[0], optimized_prediction)
+        val_score = agent.logging_metric(val_examples[0], optimized_prediction)
         logger.info(f"Validation score: {val_score:.4f}")
 
     logger.info(f"Run directory: {run_config.run_dir}")

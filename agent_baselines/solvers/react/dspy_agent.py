@@ -1,26 +1,23 @@
 """DSPy-compatible ReAct agent with optimizable prompts.
 
-This module provides DSPy signatures and a module for optimizing the ReAct agent's
-prompts using DSPy optimizers like MIPRO or GEPA.
+This module provides ReactInspectAgent, a dspy.Module that encapsulates the complete
+optimization pipeline for ReAct agent prompts using DSPy optimizers like MIPRO or GEPA.
 
-The key design is that signature instructions (docstrings) ARE the agent prompts.
-DSPy optimizers modify these instructions based on agent performance, allowing
-direct optimization of the prompts that the agent sees.
+Key Design:
+- ReactInspectAgent IS the dspy.Module (not a wrapper)
+- Signature instructions ARE the agent prompts (seeded from basic_agent defaults)
+- forward() and metric() work together via cached eval results
 
-Architecture:
-1. Signature instructions define the agent prompts (seeded from basic_agent defaults)
-2. DSPy optimizers modify the instructions based on agent performance
-3. After optimization, extract the optimized instructions as final prompts
-4. Use them with system_message() which handles {submit} placeholder replacement
-
-Caching Mechanism:
-- forward() runs actual agent evals when sample data is provided (during bootstrap)
-- Results are cached in the prediction (eval_path, answer)
-- The metric function checks for cached results and reuses them instead of re-running
-- This allows bootstrap to create useful demonstrations without redundant evals
+Optimization Flow:
+1. DSPy optimizer calls agent.forward() which runs eval and caches result
+2. DSPy optimizer calls agent.metric() which extracts score from cached eval
+3. Optimizer modifies signature instructions based on scores
+4. After optimization, extract optimized instructions as final prompts
+5. Prompts flow through create_agent_with_dspy_prompts() where {submit} is replaced
 """
 
 import logging
+from dataclasses import dataclass
 
 import dspy
 from inspect_ai.log import read_eval_log
@@ -40,6 +37,20 @@ logger = logging.getLogger(__name__)
 AgentSystemPromptSignature = dspy.Signature("task -> response", DEFAULT_SYSTEM_MESSAGE)
 
 AgentContinuePromptSignature = dspy.Signature(" -> ", DEFAULT_CONTINUE_MESSAGE)
+
+
+@dataclass
+class ReactAgentConfig:
+    """Fixed configuration for ReactInspectAgent.
+
+    These parameters stay constant during optimization.
+    Tunable parameters (what DSPy optimizes) are the signature instructions.
+    """
+
+    eval_models: list[str]  # Models to evaluate prompts on
+    agent_kwargs: dict  # Agent config (e.g., {"max_steps": 10})
+    eval_timeout: int  # Timeout per sample evaluation
+    log_dir: str  # Directory for evaluation logs
 
 
 def extract_answer_from_eval(eval_path: str) -> str | None:
@@ -127,55 +138,75 @@ def extract_score_from_eval(eval_path: str, primary_metric: str) -> float:
         raise
 
 
-class DSPyReActPrompts(dspy.Module):
-    """DSPy module that provides optimizable agent prompts via signature instructions.
+@solver
+def create_agent_with_dspy_prompts(
+    system_message_text: str,
+    continue_message_text: str,
+    max_steps: int = 10,
+    **kwargs,
+) -> Solver:
+    """Create a basic_agent solver with DSPy-optimized prompts.
 
-    This module:
-    1. Defines prompts as signature instructions (docstrings)
-    2. Creates predictors so DSPy optimizers can modify the signatures
-    3. Returns the current signature instructions in forward()
-    4. Runs actual agent evals when sample data is provided (enables bootstrap)
-    5. After optimization, provides optimized instructions for use as agent prompts
+    Args:
+        system_message_text: The system message prompt
+        continue_message_text: The continue message prompt
+        max_steps: Maximum number of agent steps
+        **kwargs: Additional arguments to pass to basic_agent
 
-    DSPy optimizers (like MIPRO) modify the signature instructions based on
-    agent performance metrics, directly optimizing the prompts that the agent sees.
-
-    The forward() method now supports running actual agent evaluations during
-    bootstrap, caching the results so the metric function can reuse them without
-    redundant evals.
+    Returns:
+        A configured basic_agent solver
     """
 
-    def __init__(
-        self,
-        eval_models: list[str] | None = None,
-        agent_kwargs: dict | None = None,
-        eval_timeout: int = 1200,
-        log_dir: str | None = None,
-        solver_path: str | None = None,
-    ):
-        """Initialize DSPyReActPrompts module.
+    @solver
+    def custom_system_message() -> Solver:
+        return system_message(system_message_text, submit=DEFAULT_SUBMIT_NAME)
+
+    return basic_agent(
+        init=custom_system_message(),
+        continue_message=continue_message_text,
+        max_steps=max_steps,
+        **kwargs,
+    )
+
+
+class ReactInspectAgent(dspy.Module):
+    """DSPy module for optimizing ReAct agent prompts.
+
+    This module encapsulates the complete ReAct agent optimization:
+    1. Tunable parameters - signature instructions that DSPy optimizes
+    2. Fixed parameters - models, timeouts, agent config (stays constant)
+    3. forward() - extracts prompts and runs agent evaluation
+    4. metric() - extracts scores from cached eval results
+
+    The evaluation flow:
+    - forward() runs agent evals via eval_in_subprocess() and caches results
+    - metric() extracts scores from the cached eval files
+
+    This design makes it clear that forward() and metric() work together.
+    To optimize a different agent, create a new dspy.Module subclass with
+    its own forward() and metric() methods.
+    """
+
+    # Solver path for ReAct agent with DSPy-optimizable prompts
+    solver_path = (
+        "agent_baselines/solvers/react/dspy_agent.py@create_agent_with_dspy_prompts"
+    )
+
+    def __init__(self, config: ReactAgentConfig):
+        """Initialize ReAct agent module with fixed configuration.
 
         Args:
-            eval_models: List of models to evaluate on (for running actual evals)
-            agent_kwargs: Agent configuration dict (e.g., {"max_steps": 10})
-            eval_timeout: Timeout per sample evaluation in seconds
-            log_dir: Directory for evaluation logs
-            solver_path: Path to solver for eval_in_subprocess
+            config: Fixed agent configuration (models, timeouts, etc.)
         """
         super().__init__()
 
+        self.config = config
+
         # Create predictors so DSPy optimizers can access and modify their signatures
-        # The signature instructions (docstrings) are what get optimized
+        # The signature instructions are what get optimized
         # Note: These predictors are never actually called - we just extract their instructions
         self.system_prompt = dspy.Predict(AgentSystemPromptSignature)
         self.continue_prompt = dspy.Predict(AgentContinuePromptSignature)
-
-        # Store config for running actual evals
-        self.eval_models = eval_models
-        self.agent_kwargs = agent_kwargs or {}
-        self.eval_timeout = eval_timeout
-        self.log_dir = log_dir
-        self.solver_path = solver_path
 
     def forward(
         self,
@@ -184,20 +215,14 @@ class DSPyReActPrompts(dspy.Module):
         primary_metric: str | None = None,
         task: str | None = None,
     ):
-        """Return current signature instructions as agent prompts, optionally running eval.
+        """Extract signature instructions and run agent evaluation.
 
-        This method extracts the signature instructions (which DSPy optimizers modify)
-        and returns them as the agent's system_message and continue_message.
+        This method:
+        1. Extracts signature instructions (modified by DSPy optimizers)
+        2. Runs eval_in_subprocess() to evaluate the agent with current prompts
+        3. Caches the eval result in prediction.eval_path for metric() to use
 
-        When sample data is provided (sample_id, task_path, primary_metric), this
-        method will run an actual agent evaluation and cache the results. This enables
-        DSPy's bootstrap to create useful demonstrations based on actual agent behavior.
-
-        The metric function checks for the presence of eval_path in the prediction and
-        reuses the cached results instead of re-running the evaluation, avoiding
-        redundant computation.
-
-        Note: The signature instructions contain {submit} placeholders which are NOT
+        The signature instructions contain {submit} placeholders which are NOT
         replaced here. They will be replaced by inspect_ai's system_message() via
         str.format() when the prompts are used in create_agent_with_dspy_prompts().
 
@@ -232,100 +257,120 @@ class DSPyReActPrompts(dspy.Module):
             and task_path is not None
             and primary_metric is not None
         ):
-            # Check if we have the necessary config to run evals
-            if (
-                self.eval_models is None
-                or self.log_dir is None
-                or self.solver_path is None
-            ):
-                logger.warning(
-                    f"Sample data provided but eval config incomplete. "
-                    f"Skipping eval for sample {sample_id}. "
-                    f"Set eval_models, log_dir, and solver_path in __init__ to enable eval caching."
+            try:
+                # Import here to avoid circular dependency
+                from agent_baselines.solvers.react.parallel_eval import (
+                    eval_in_subprocess,
                 )
-            else:
-                try:
-                    # Import here to avoid circular dependency
-                    from agent_baselines.solvers.react.parallel_eval import (
-                        eval_in_subprocess,
-                    )
 
-                    # Build agent_params dict with current prompts
-                    agent_params = {
-                        "system_message_text": system_instructions,
-                        "continue_message_text": continue_instructions,
-                        **self.agent_kwargs,
-                    }
+                # Build agent_params dict with current prompts
+                agent_params = {
+                    "system_message_text": system_instructions,
+                    "continue_message_text": continue_instructions,
+                    **self.config.agent_kwargs,
+                }
 
-                    # Run evaluation in subprocess
+                # Run evaluation in subprocess
+                logger.info(
+                    f"Running eval for sample {sample_id} (caching for optimization)"
+                )
+
+                # Run the evaluation - returns both score and eval_path
+                score, eval_path = eval_in_subprocess(
+                    sample_id=sample_id,
+                    model_names=self.config.eval_models,
+                    task_path=task_path,
+                    primary_metric=primary_metric,
+                    solver_path=self.solver_path,
+                    agent_params=agent_params,
+                    timeout=self.config.eval_timeout,
+                    inspect_log_dir=self.config.log_dir,
+                )
+
+                if eval_path:
+                    # Extract answer from the eval file
+                    answer = extract_answer_from_eval(eval_path)
+
+                    # Add to prediction for caching
+                    prediction_fields["eval_path"] = eval_path
+                    prediction_fields["answer"] = answer or ""
+
                     logger.info(
-                        f"Running eval for sample {sample_id} (caching for bootstrap)"
+                        f"Cached eval result for sample {sample_id}: "
+                        f"score={score:.4f}, eval_path={eval_path}"
                     )
+                else:
+                    logger.warning(f"No eval file path returned for sample {sample_id}")
 
-                    # Run the evaluation - returns both score and eval_path
-                    score, eval_path = eval_in_subprocess(
-                        sample_id=sample_id,
-                        model_names=self.eval_models,
-                        task_path=task_path,
-                        primary_metric=primary_metric,
-                        solver_path=self.solver_path,
-                        agent_params=agent_params,
-                        timeout=self.eval_timeout,
-                        inspect_log_dir=self.log_dir,
-                    )
-
-                    if eval_path:
-                        # Extract answer from the eval file
-                        answer = extract_answer_from_eval(eval_path)
-
-                        # Add to prediction for caching
-                        prediction_fields["eval_path"] = eval_path
-                        prediction_fields["answer"] = answer or ""
-
-                        logger.info(
-                            f"Cached eval result for sample {sample_id}: "
-                            f"score={score:.4f}, eval_path={eval_path}"
-                        )
-                    else:
-                        logger.warning(
-                            f"No eval file path returned for sample {sample_id}"
-                        )
-
-                except Exception as e:
-                    logger.error(
-                        f"Error running eval for sample {sample_id} in forward(): {e}"
-                    )
-                    # Continue without caching - metric will run eval normally
+            except Exception as e:
+                logger.error(
+                    f"Error running eval for sample {sample_id} in forward(): {e}"
+                )
+                # Continue without caching - metric will raise error
 
         return dspy.Prediction(**prediction_fields)
 
+    def metric(self, example, prediction, trace=None):
+        """Metric function for DSPy optimization that extracts cached eval scores.
 
-@solver
-def create_agent_with_dspy_prompts(
-    system_message_text: str,
-    continue_message_text: str,
-    max_steps: int = 10,
-    **kwargs,
-) -> Solver:
-    """Create a basic_agent solver with DSPy-optimized prompts.
+        DSPy optimizers call forward() to get prompts, then call this metric to score
+        them. Since forward() always runs eval_in_subprocess() and caches the result
+        in prediction.eval_path, this function simply extracts the score from that
+        cached eval file.
 
-    Args:
-        system_message_text: The system message prompt
-        continue_message_text: The continue message prompt
-        max_steps: Maximum number of agent steps
-        **kwargs: Additional arguments to pass to basic_agent
+        Args:
+            example: DSPy Example with sample_id, task_path, primary_metric
+            prediction: DSPy Prediction with eval_path (cached result from forward())
+            trace: Optional trace (unused)
 
-    Returns:
-        A configured basic_agent solver
-    """
+        Returns:
+            Score extracted from cached eval file
 
-    @solver
-    def custom_system_message() -> Solver:
-        return system_message(system_message_text, submit=DEFAULT_SUBMIT_NAME)
+        Raises:
+            ValueError: If eval_path is missing or score extraction fails
+        """
+        sample_id = example.sample_id
+        primary_metric = example.primary_metric
 
-    return basic_agent(
-        init=custom_system_message(),
-        continue_message=continue_message_text,
-        max_steps=max_steps,
-        **kwargs,
-    )
+        # Extract score from cached .eval file
+        # forward() always caches eval results, so eval_path should always be present
+        if not hasattr(prediction, "eval_path") or not prediction.eval_path:
+            raise ValueError(
+                f"Missing eval_path in prediction for sample {sample_id}. "
+                f"forward() should have cached the eval result."
+            )
+
+        logger.info(
+            f"Extracting score for {sample_id} from cached eval: {prediction.eval_path}"
+        )
+        score_value = extract_score_from_eval(prediction.eval_path, primary_metric)
+        return score_value
+
+    def logging_metric(self, example, prediction, trace=None):
+        """Metric with logging wrapper for visibility during optimization.
+
+        This wraps the base metric with logging behavior for user visibility.
+
+        Args:
+            example: DSPy Example with sample_id, task_name, primary_metric
+            prediction: DSPy Prediction with eval_path (cached result from forward())
+            trace: Optional trace (unused)
+
+        Returns:
+            Score extracted from cached eval file
+        """
+        sample_id = example.sample_id
+        task_name = example.task_name
+
+        try:
+            # Call base metric for evaluation
+            score_value = self.metric(example, prediction, trace)
+
+            # Log result concisely
+            logger.info(f"✓ {sample_id} ({task_name}): {score_value:.4f}")
+            return score_value
+
+        except Exception as e:
+            # Log failure
+            logger.info(f"✗ {sample_id} ({task_name}): {e}")
+            raise
