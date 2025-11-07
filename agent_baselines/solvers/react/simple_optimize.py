@@ -57,6 +57,39 @@ SAMPLES_PER_TASK_FOR_MINIBATCH = 5
 
 
 @dataclass
+class TaskLoadingConfig:
+    """Configuration for loading task data."""
+
+    config_path: str | None
+    task_split: str | None
+    tasks: list[str] | None
+    samples_per_task: int
+    train_ratio: float
+
+
+@dataclass
+class OptimizerConfig:
+    """Configuration for DSPy optimizer."""
+
+    optimizer_type: str
+    optimizer_model: str | None
+    num_candidates: int
+    num_trials: int | None
+    max_bootstrapped_demos: int
+    max_labeled_demos: int
+    temperature: float
+
+
+@dataclass
+class RunConfig:
+    """Runtime configuration."""
+
+    run_dir: str | None
+    output_file: str
+    verbose_llm: bool
+
+
+@dataclass
 class ReactAgentConfig:
     """Encapsulates configuration for ReAct agent wrapper.
 
@@ -214,141 +247,6 @@ class ReactInspectAgent:
 
 
 # ============================================================================
-# Optimizer Configuration
-# ============================================================================
-
-
-def create_optimizer(
-    optimizer_type: str,
-    metric: Callable,
-    num_candidates: int,
-    temperature: float,
-    run_dir: str,
-) -> tuple[Any, str]:
-    """Create and configure DSPy optimizer.
-
-    Args:
-        optimizer_type: "mipro", "gepa", or "bootstrap"
-        metric: Metric function for evaluation
-        num_candidates: Number of candidate prompts
-        temperature: Temperature for prompt generation
-        run_dir: Directory for optimizer logs
-
-    Returns:
-        Tuple of (optimizer instance, optimizer name)
-    """
-    if optimizer_type == "gepa":
-        try:
-            from dspy.propose import GEPA
-
-            optimizer = GEPA(
-                metric=metric,
-                breadth=num_candidates,
-                depth=3,
-                init_temperature=temperature,
-            )
-            return optimizer, "GEPA"
-        except ImportError:
-            raise ImportError(
-                "GEPA optimizer not available. Install with: pip install dspy-ai[gepa]"
-            )
-
-    elif optimizer_type == "mipro":
-        optimizer = dspy.MIPROv2(
-            metric=metric,
-            auto=None,
-            num_candidates=num_candidates,
-            init_temperature=temperature,
-            log_dir=run_dir,
-        )
-        return optimizer, "MIPROv2"
-
-    elif optimizer_type == "bootstrap":
-        optimizer = dspy.BootstrapFewShot(metric=metric)
-        return optimizer, "BootstrapFewShot"
-
-    else:
-        raise ValueError(
-            f"Unknown optimizer type: {optimizer_type}. "
-            f"Choose from: 'gepa', 'mipro', 'bootstrap'"
-        )
-
-
-def calculate_compile_kwargs(
-    optimizer_type: str,
-    agent_wrapper: ReactInspectAgent,
-    train_examples: list,
-    val_examples: list,
-    num_tasks: int,
-    num_candidates: int,
-    num_trials: int | None,
-    max_bootstrapped_demos: int,
-    max_labeled_demos: int,
-) -> dict:
-    """Calculate compilation kwargs for optimizer.
-
-    This handles optimizer-specific parameter calculation, particularly for
-    MIPRO's num_trials and minibatch_size formulas.
-
-    Args:
-        optimizer_type: Type of optimizer
-        agent_wrapper: Agent wrapper providing tunable module
-        train_examples: Training examples
-        val_examples: Validation examples
-        num_tasks: Number of tasks being optimized
-        num_candidates: Number of candidate prompts
-        num_trials: Manual override for num_trials (MIPRO only)
-        max_bootstrapped_demos: Max bootstrapped demonstrations
-        max_labeled_demos: Max labeled demonstrations
-
-    Returns:
-        Dictionary of kwargs for optimizer.compile()
-    """
-    compile_kwargs = {
-        "trainset": train_examples,
-        "max_bootstrapped_demos": max_bootstrapped_demos,
-        "max_labeled_demos": max_labeled_demos,
-    }
-
-    if optimizer_type == "mipro":
-        # Calculate num_trials using DSPy's formula if not provided
-        # Formula: max(2 * num_vars * log2(N), 1.5 * N)
-        # where num_vars = num_predictors * 2 (system + continue message)
-        if num_trials is None:
-            # Get module from agent wrapper to count predictors
-            react_prompts = agent_wrapper.get_tunable_module()
-            num_predictors = len(react_prompts.predictors())
-            num_vars = num_predictors * 2
-            num_trials = int(
-                max(2 * num_vars * np.log2(num_candidates), 1.5 * num_candidates)
-            )
-
-        compile_kwargs["num_trials"] = num_trials
-
-        # Calculate adaptive minibatch size
-        # Ensures adequate coverage across all tasks during optimization
-        desired_minibatch = num_tasks * SAMPLES_PER_TASK_FOR_MINIBATCH
-        compile_kwargs["minibatch_size"] = min(len(train_examples), len(val_examples), desired_minibatch)
-        compile_kwargs["minibatch"] = True
-
-        # Log configuration
-        logger.info(f"MIPRO num_trials: {num_trials} (DSPy formula)")
-        logger.info(
-            f"MIPRO minibatch_size: {compile_kwargs['minibatch_size']} "
-            f"(min of train={len(train_examples)}, val={len(val_examples)}, "
-            f"desired={desired_minibatch} [{num_tasks} tasks × {SAMPLES_PER_TASK_FOR_MINIBATCH}])"
-        )
-
-        if len(val_examples) < desired_minibatch:
-            logger.warning(
-                f"Validation set size ({len(val_examples)}) limits minibatch size. "
-                f"Consider increasing samples_per_task for better multi-task coverage."
-            )
-
-    return compile_kwargs
-
-
-# ============================================================================
 # LLM Logging Infrastructure (Optional)
 # ============================================================================
 
@@ -450,84 +348,22 @@ def setup_dspy_with_logging(
 
 
 # ============================================================================
-# Main Optimization Function
+# Optimization Pipeline Functions
 # ============================================================================
 
 
-def optimize_react_prompts(
-    # Data loading
-    config_path: str | None = None,
-    task_split: str | None = "validation",
-    tasks: list[str] | None = None,
-    samples_per_task: int = 5,
-    train_ratio: float = 0.8,
-    # Agent configuration
-    eval_models: list[str] | str = "openai/gpt-4o",
-    agent_kwargs: dict | None = None,
-    # Optimizer configuration
-    optimizer_type: str = "mipro",
-    optimizer_model: str | None = None,
-    num_candidates: int = 5,
-    num_trials: int | None = None,
-    max_bootstrapped_demos: int = 3,
-    max_labeled_demos: int = 3,
-    optimizer_temperature: float = 1.0,
-    # Evaluation configuration
-    eval_timeout: int = 600,
-    # Output configuration
-    output_file: str = "optimized_prompts.json",
-    run_dir: str | None = None,
-    verbose_llm: bool = False,
-) -> dict:
-    """Optimize ReAct agent prompts using DSPy across multiple tasks and models.
-
-    This is the main entry point that orchestrates the optimization pipeline.
-
-    Args:
-        # Data loading
-        config_path: Path to astabench config (defaults to astabench v1.0.0)
-        task_split: Which split to use (e.g., "validation"). Mutually exclusive with tasks.
-        tasks: Specific task paths (e.g., ["astabench/sqa_dev"]). Mutually exclusive with task_split.
-        samples_per_task: Max samples per task
-        train_ratio: Train/val split ratio (default 0.8 = 80/20)
-
-        # Agent configuration
-        eval_models: Model(s) for agent evaluation (string or list)
-        agent_kwargs: Agent config dict (e.g., {"max_steps": 10})
-
-        # Optimizer configuration
-        optimizer_type: "mipro", "gepa", or "bootstrap"
-        optimizer_model: Model for DSPy optimization (defaults to first eval model)
-        num_candidates: Number of candidate prompts
-        num_trials: MIPRO trials (defaults to DSPy formula)
-        max_bootstrapped_demos: Max bootstrapped demonstrations
-        max_labeled_demos: Max labeled demonstrations
-        optimizer_temperature: Temperature for prompt generation
-
-        # Evaluation configuration
-        eval_timeout: Timeout per sample evaluation (seconds)
-
-        # Output configuration
-        output_file: Where to save optimized prompts
-        run_dir: Run directory (defaults to timestamped .dspy_cache/run_*)
-        verbose_llm: Enable LLM call logging
+def setup_optimization_run(
+    optimizer_config: OptimizerConfig,
+    agent_config: ReactAgentConfig,
+    run_config: RunConfig,
+) -> str:
+    """Setup run directory and configure DSPy.
 
     Returns:
-        Dictionary with optimized prompts and metadata
+        run_dir: Path to the run directory
     """
-    # ========================================
-    # Setup and Validation
-    # ========================================
-
-    # Default configurations
-    if agent_kwargs is None:
-        agent_kwargs = {}
-
-    # Normalize eval_models to list
-    if isinstance(eval_models, str):
-        eval_models = [eval_models]
-
     # Create run directory
+    run_dir = run_config.run_dir
     if run_dir is None:
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         run_dir = f".dspy_cache/run_{timestamp}"
@@ -538,25 +374,32 @@ def optimize_react_prompts(
     logger.info("=" * 80)
 
     # Configure DSPy
-    optimizer_model = optimizer_model or eval_models[0]
-    setup_dspy_with_logging(optimizer_model, run_dir, verbose_llm)
+    optimizer_model = optimizer_config.optimizer_model or agent_config.eval_models[0]
+    setup_dspy_with_logging(optimizer_model, run_dir, run_config.verbose_llm)
 
-    logger.info(f"Eval models: {', '.join(eval_models)}")
+    logger.info(f"Eval models: {', '.join(agent_config.eval_models)}")
     logger.info(f"Optimizer model: {optimizer_model}")
 
-    # ========================================
-    # Phase 1: Load Task Data
-    # ========================================
+    return run_dir
 
+
+def load_and_prepare_data(
+    task_config: TaskLoadingConfig,
+) -> tuple[list, list, list]:
+    """Load task data and create train/val splits.
+
+    Returns:
+        Tuple of (train_examples, val_examples, task_configs)
+    """
     logger.info("\n" + "=" * 80)
     logger.info("PHASE 1: Loading task data")
     logger.info("=" * 80)
 
     # Load task configurations
     task_configs = load_tasks_from_config(
-        config_path=config_path,
-        split=task_split,
-        task_paths=tasks,
+        config_path=task_config.config_path,
+        split=task_config.task_split,
+        task_paths=task_config.tasks,
     )
 
     logger.info(f"Loaded {len(task_configs)} task configs")
@@ -566,14 +409,14 @@ def optimize_react_prompts(
     # Load samples from tasks
     sample_tuples = load_samples_from_tasks(
         task_configs=task_configs,
-        samples_per_task=samples_per_task,
+        samples_per_task=task_config.samples_per_task,
     )
     logger.info(f"Loaded {len(sample_tuples)} total samples across all tasks")
 
     # Create DSPy examples and split train/val
     train_examples, val_examples = create_mixed_dspy_examples(
         sample_tuples=sample_tuples,
-        train_ratio=train_ratio,
+        train_ratio=task_config.train_ratio,
     )
     logger.info(f"Split: {len(train_examples)} train, {len(val_examples)} val")
 
@@ -585,69 +428,118 @@ def optimize_react_prompts(
     rng = random.Random(42)
     train_examples = interleave_tasks(train_examples, rng=rng)
 
-    # ========================================
-    # Phase 2: Create Agent Wrapper
-    # ========================================
+    return train_examples, val_examples, task_configs
 
-    logger.info("\n" + "=" * 80)
-    logger.info("PHASE 2: Creating agent wrapper")
-    logger.info("=" * 80)
 
-    agent_config = ReactAgentConfig(
-        eval_models=eval_models,
-        agent_kwargs=agent_kwargs,
-        eval_timeout=eval_timeout,
-        log_dir=f"{run_dir}/eval_logs",
-    )
+def run_optimization(
+    agent_wrapper: ReactInspectAgent,
+    train_examples: list,
+    val_examples: list,
+    optimizer_config: OptimizerConfig,
+    num_tasks: int,
+    run_dir: str,
+) -> tuple[Any, str]:
+    """Configure optimizer and run optimization.
 
-    agent_wrapper = ReactInspectAgent(agent_config)
-
-    # Create metric function (with logging for visibility)
-    metric = agent_wrapper.create_logging_metric()
-
-    logger.info("Agent wrapper created")
-    logger.info(f"  Eval models: {eval_models}")
-    logger.info(f"  Agent kwargs: {agent_kwargs}")
-    logger.info(f"  Eval timeout: {eval_timeout}s")
-    logger.info(f"  Eval logs: {agent_config.log_dir}")
-
-    # ========================================
-    # Phase 3: Configure Optimizer
-    # ========================================
-
+    Returns:
+        Tuple of (optimized_module, optimizer_name)
+    """
     logger.info("\n" + "=" * 80)
     logger.info("PHASE 3: Configuring optimizer")
     logger.info("=" * 80)
 
-    optimizer, optimizer_name = create_optimizer(
-        optimizer_type=optimizer_type,
-        metric=metric,
-        num_candidates=num_candidates,
-        temperature=optimizer_temperature,
-        run_dir=run_dir,
-    )
+    # Create metric function (with logging for visibility)
+    metric = agent_wrapper.create_logging_metric()
+
+    # Prepare common compile kwargs
+    compile_kwargs = {
+        "trainset": train_examples,
+        "max_bootstrapped_demos": optimizer_config.max_bootstrapped_demos,
+        "max_labeled_demos": optimizer_config.max_labeled_demos,
+    }
+
+    # Create optimizer and add optimizer-specific kwargs
+    optimizer_type = optimizer_config.optimizer_type
+
+    if optimizer_type == "gepa":
+        try:
+            from dspy.propose import GEPA
+
+            optimizer = GEPA(
+                metric=metric,
+                breadth=optimizer_config.num_candidates,
+                depth=3,
+                init_temperature=optimizer_config.temperature,
+            )
+            optimizer_name = "GEPA"
+        except ImportError:
+            raise ImportError(
+                "GEPA optimizer not available. Install with: pip install dspy-ai[gepa]"
+            )
+
+    elif optimizer_type == "mipro":
+        optimizer = dspy.MIPROv2(
+            metric=metric,
+            auto=None,
+            num_candidates=optimizer_config.num_candidates,
+            init_temperature=optimizer_config.temperature,
+            log_dir=run_dir,
+        )
+        optimizer_name = "MIPROv2"
+
+        # Calculate num_trials using DSPy's formula if not provided
+        # Formula: max(2 * num_vars * log2(N), 1.5 * N)
+        # where num_vars = num_predictors * 2 (system + continue message)
+        num_trials = optimizer_config.num_trials
+        if num_trials is None:
+            react_prompts = agent_wrapper.get_tunable_module()
+            num_predictors = len(react_prompts.predictors())
+            num_vars = num_predictors * 2
+            num_trials = int(
+                max(
+                    2 * num_vars * np.log2(optimizer_config.num_candidates),
+                    1.5 * optimizer_config.num_candidates,
+                )
+            )
+
+        compile_kwargs["num_trials"] = num_trials
+
+        # Calculate adaptive minibatch size
+        # Ensures adequate coverage across all tasks during optimization
+        desired_minibatch = num_tasks * SAMPLES_PER_TASK_FOR_MINIBATCH
+        compile_kwargs["minibatch_size"] = min(
+            len(train_examples), len(val_examples), desired_minibatch
+        )
+        compile_kwargs["minibatch"] = True
+
+        # Log MIPRO configuration
+        logger.info(f"MIPRO num_trials: {num_trials} (DSPy formula)")
+        logger.info(
+            f"MIPRO minibatch_size: {compile_kwargs['minibatch_size']} "
+            f"(min of train={len(train_examples)}, val={len(val_examples)}, "
+            f"desired={desired_minibatch} [{num_tasks} tasks × {SAMPLES_PER_TASK_FOR_MINIBATCH}])"
+        )
+
+        if len(val_examples) < desired_minibatch:
+            logger.warning(
+                f"Validation set size ({len(val_examples)}) limits minibatch size. "
+                f"Consider increasing samples_per_task for better multi-task coverage."
+            )
+
+    elif optimizer_type == "bootstrap":
+        optimizer = dspy.BootstrapFewShot(metric=metric)
+        optimizer_name = "BootstrapFewShot"
+
+    else:
+        raise ValueError(
+            f"Unknown optimizer type: {optimizer_type}. "
+            f"Choose from: 'gepa', 'mipro', 'bootstrap'"
+        )
 
     logger.info(f"Optimizer: {optimizer_name}")
-    logger.info(f"  Candidates: {num_candidates}")
-    logger.info(f"  Temperature: {optimizer_temperature}")
-
-    compile_kwargs = calculate_compile_kwargs(
-        optimizer_type=optimizer_type,
-        agent_wrapper=agent_wrapper,
-        train_examples=train_examples,
-        val_examples=val_examples,
-        num_tasks=len(task_configs),
-        num_candidates=num_candidates,
-        num_trials=num_trials,
-        max_bootstrapped_demos=max_bootstrapped_demos,
-        max_labeled_demos=max_labeled_demos,
-    )
-
+    logger.info(f"  Candidates: {optimizer_config.num_candidates}")
+    logger.info(f"  Temperature: {optimizer_config.temperature}")
     logger.info(f"Compile kwargs: {list(compile_kwargs.keys())}")
-
-    # ========================================
-    # Phase 4: Run Optimization
-    # ========================================
 
     logger.info("\n" + "=" * 80)
     logger.info("PHASE 4: Running optimization")
@@ -665,6 +557,65 @@ def optimize_react_prompts(
 
     logger.info("Optimization complete!")
 
+    return optimized_module, optimizer_name
+
+
+# ============================================================================
+# Main Optimization Function
+# ============================================================================
+
+
+def optimize_react_prompts(
+    task_config: TaskLoadingConfig,
+    agent_config: ReactAgentConfig,
+    optimizer_config: OptimizerConfig,
+    run_config: RunConfig,
+) -> dict:
+    """Optimize ReAct agent prompts using DSPy across multiple tasks and models.
+
+    This is the main entry point that orchestrates the optimization pipeline.
+
+    Args:
+        task_config: Configuration for loading task data
+        agent_config: Configuration for ReAct agent wrapper
+        optimizer_config: Configuration for DSPy optimizer
+        run_config: Runtime configuration
+
+    Returns:
+        Dictionary with optimized prompts and metadata
+    """
+    # Setup
+    run_dir = setup_optimization_run(optimizer_config, agent_config, run_config)
+
+    # Load data
+    train_examples, val_examples, task_configs = load_and_prepare_data(task_config)
+
+    # Create agent wrapper
+    logger.info("\n" + "=" * 80)
+    logger.info("PHASE 2: Creating agent wrapper")
+    logger.info("=" * 80)
+
+    agent_config.log_dir = (
+        f"{run_dir}/eval_logs"  # Update log_dir now that we have run_dir
+    )
+    agent_wrapper = ReactInspectAgent(agent_config)
+
+    logger.info("Agent wrapper created")
+    logger.info(f"  Eval models: {agent_config.eval_models}")
+    logger.info(f"  Agent kwargs: {agent_config.agent_kwargs}")
+    logger.info(f"  Eval timeout: {agent_config.eval_timeout}s")
+    logger.info(f"  Eval logs: {agent_config.log_dir}")
+
+    # Run optimization
+    optimized_module, optimizer_name = run_optimization(
+        agent_wrapper=agent_wrapper,
+        train_examples=train_examples,
+        val_examples=val_examples,
+        optimizer_config=optimizer_config,
+        num_tasks=len(task_configs),
+        run_dir=run_dir,
+    )
+
     # ========================================
     # Phase 5: Save and Evaluate Results
     # ========================================
@@ -679,26 +630,33 @@ def optimize_react_prompts(
         submit_function_name=DEFAULT_SUBMIT_NAME,
     )
 
+    # Determine optimizer model for metadata
+    optimizer_model = optimizer_config.optimizer_model or agent_config.eval_models[0]
+
     # Package results
     optimized_prompts = {
         "system_message": optimized_prediction.system_message,
         "continue_message": optimized_prediction.continue_message,
         "metadata": {
-            "eval_models": eval_models,
+            "eval_models": agent_config.eval_models,
             "optimizer_model": optimizer_model,
             "optimizer": optimizer_name,
-            "num_candidates": num_candidates if optimizer_type != "bootstrap" else None,
+            "num_candidates": (
+                optimizer_config.num_candidates
+                if optimizer_config.optimizer_type != "bootstrap"
+                else None
+            ),
             "train_samples": len(train_examples),
             "val_samples": len(val_examples),
             "tasks": [tc.name for tc in task_configs],
             "task_paths": [tc.path for tc in task_configs],
-            "task_split": task_split,
-            "samples_per_task": samples_per_task,
+            "task_split": task_config.task_split,
+            "samples_per_task": task_config.samples_per_task,
         },
     }
 
     # Save to file
-    output_path = Path(__file__).parent / output_file
+    output_path = Path(__file__).parent / run_config.output_file
     with open(output_path, "w") as f:
         json.dump(optimized_prompts, f, indent=2)
 
@@ -711,6 +669,7 @@ def optimize_react_prompts(
     # Validate on first val example
     if val_examples:
         logger.info("\nValidating on first val example...")
+        metric = agent_wrapper.create_logging_metric()
         val_score = metric(val_examples[0], optimized_prediction)
         logger.info(f"Validation score: {val_score:.4f}")
 
@@ -855,26 +814,42 @@ if __name__ == "__main__":
     # Build agent_kwargs
     agent_kwargs = {"max_steps": args.agent_max_steps}
 
-    # Run optimization
-    optimize_react_prompts(
-        # Data loading
+    # Parse config objects from CLI args
+    task_config = TaskLoadingConfig(
         config_path=args.config_path,
         task_split=task_split,
         tasks=tasks,
         samples_per_task=args.samples_per_task,
         train_ratio=args.train_ratio,
-        # Agent configuration
+    )
+
+    agent_config = ReactAgentConfig(
         eval_models=models,
         agent_kwargs=agent_kwargs,
-        # Optimizer configuration
+        eval_timeout=args.eval_timeout,
+        log_dir=None,  # Will be set in optimize_react_prompts based on run_dir
+    )
+
+    optimizer_config = OptimizerConfig(
         optimizer_type=args.optimizer,
         optimizer_model=args.optimizer_model,
         num_candidates=args.num_candidates,
         num_trials=args.num_trials,
-        optimizer_temperature=args.optimizer_temperature,
-        # Evaluation configuration
-        eval_timeout=args.eval_timeout,
-        # Output configuration
+        max_bootstrapped_demos=3,
+        max_labeled_demos=3,
+        temperature=args.optimizer_temperature,
+    )
+
+    run_config = RunConfig(
+        run_dir=None,  # Will be created in optimize_react_prompts
         output_file=args.output,
         verbose_llm=args.verbose_llm,
+    )
+
+    # Call with configs
+    optimize_react_prompts(
+        task_config=task_config,
+        agent_config=agent_config,
+        optimizer_config=optimizer_config,
+        run_config=run_config,
     )
