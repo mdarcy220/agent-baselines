@@ -257,8 +257,8 @@ def eval_in_subprocess(
     primary_metric: str,
     solver_path: str,
     agent_params: dict,
+    inspect_log_dir: str,
     timeout: int = 600,
-    inspect_log_dir: str = ".dspy_cache",
 ) -> float:
     """Run inspect_ai.eval() in an isolated subprocess with multi-model support.
 
@@ -271,8 +271,8 @@ def eval_in_subprocess(
         primary_metric: Primary metric to extract (e.g., "global_avg/mean")
         solver_path: Path to solver (e.g., "agent_baselines/solvers/react/dspy_agent.py@create_agent_with_dspy_prompts")
         agent_params: Parameters to pass to the solver factory as kwargs
+        inspect_log_dir: Directory for logs
         timeout: Timeout in seconds (default: 600)
-        inspect_log_dir: Directory for logs (default: ".dspy_cache")
 
     Returns:
         Average score across all models for this sample
@@ -285,12 +285,9 @@ def eval_in_subprocess(
     # This properly handles return values without needing Queue
 
     # Derive stdout/stderr log file from inspect_log_dir
-    # Only redirect output if we have a proper run directory (not default ".dspy_cache")
-    std_log_file = None
-    if inspect_log_dir != ".dspy_cache":
-        os.makedirs(inspect_log_dir, exist_ok=True)
-        timestamp = int(time.time() * 1000)
-        std_log_file = f"{inspect_log_dir}/{sample_id}_{timestamp}_stdout.log"
+    os.makedirs(inspect_log_dir, exist_ok=True)
+    timestamp = int(time.time() * 1000)
+    std_log_file = f"{inspect_log_dir}/{sample_id}_{timestamp}_stdout.log"
 
     # Create a single-process pool for this evaluation.
     #

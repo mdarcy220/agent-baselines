@@ -84,9 +84,10 @@ class OptimizerConfig:
 class RunConfig:
     """Runtime configuration."""
 
-    run_dir: str | None
+    run_dir: str
     output_file: str
     verbose_llm: bool
+    base_dir: str = ".dspy_cache"
 
 
 @dataclass
@@ -101,9 +102,7 @@ class ReactAgentConfig:
     eval_models: list[str]  # Models to evaluate prompts on
     agent_kwargs: dict  # Agent config (e.g., {"max_steps": 10})
     eval_timeout: int  # Timeout per sample evaluation
-
-    # Metadata for logging (not used during eval)
-    log_dir: str | None = None
+    log_dir: str  # Directory for evaluation logs
 
 
 class ReactInspectAgent:
@@ -175,9 +174,6 @@ class ReactInspectAgent:
                 **self.config.agent_kwargs,
             }
 
-            # Use eval_logs directory for both inspect logs and subprocess stdout/stderr
-            inspect_log_dir = self.config.log_dir or ".dspy_cache"
-
             # Run evaluation in subprocess (enables parallelization)
             # This handles multi-model evaluation and returns averaged score
             score_value = eval_in_subprocess(
@@ -188,7 +184,7 @@ class ReactInspectAgent:
                 solver_path=self.solver_path,
                 agent_params=agent_params,
                 timeout=self.config.eval_timeout,
-                inspect_log_dir=inspect_log_dir,
+                inspect_log_dir=self.config.log_dir,
             )
 
             return score_value
@@ -319,6 +315,7 @@ def setup_dspy_with_logging(
     optimizer_model: str,
     run_dir: str,
     verbose_llm: bool,
+    temperature: float = 1.0,
 ) -> None:
     """Configure DSPy language model with optional logging.
 
@@ -326,8 +323,10 @@ def setup_dspy_with_logging(
         optimizer_model: Model to use for DSPy optimization
         run_dir: Run directory for logs
         verbose_llm: Whether to enable LLM call logging
+        temperature: Temperature for LLM calls (default: 1.0)
     """
-    lm = dspy.LM(model=optimizer_model)
+    # For reasoning models, we need temperature=1.0 and max_tokens >= 16000
+    lm = dspy.LM(model=optimizer_model, temperature=temperature, max_tokens=16000)
 
     if verbose_llm:
         llm_log_file = f"{run_dir}/llm_calls.log"
@@ -347,27 +346,23 @@ def setup_optimization_run(
     optimizer_config: OptimizerConfig,
     agent_config: ReactAgentConfig,
     run_config: RunConfig,
-) -> str:
-    """Setup run directory and configure DSPy.
+) -> None:
+    """Setup run directory and configure DSPy."""
+    os.makedirs(run_config.run_dir, exist_ok=True)
+    os.makedirs(agent_config.log_dir, exist_ok=True)
 
-    Returns:
-        run_dir: Path to the run directory
-    """
-    run_dir = run_config.run_dir
-    if run_dir is None:
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        run_dir = f".dspy_cache/run_{timestamp}"
-    os.makedirs(run_dir, exist_ok=True)
-
-    logger.info(f"Run directory: {run_dir}")
+    logger.info(f"Run directory: {run_config.run_dir}")
 
     optimizer_model = optimizer_config.optimizer_model or agent_config.eval_models[0]
-    setup_dspy_with_logging(optimizer_model, run_dir, run_config.verbose_llm)
+    setup_dspy_with_logging(
+        optimizer_model,
+        run_config.run_dir,
+        run_config.verbose_llm,
+        optimizer_config.temperature,
+    )
 
     logger.info(f"Eval models: {', '.join(agent_config.eval_models)}")
     logger.info(f"Optimizer model: {optimizer_model}")
-
-    return run_dir
 
 
 def load_and_prepare_data(
@@ -409,6 +404,9 @@ def load_and_prepare_data(
     rng = random.Random(42)
     train_examples = interleave_tasks(train_examples, rng=rng)
 
+    logger.info(f"Train sample IDs: {[ex.sample_id for ex in train_examples]}")
+    logger.info(f"Val sample IDs: {[ex.sample_id for ex in val_examples]}")
+
     return train_examples, val_examples, task_configs
 
 
@@ -429,6 +427,7 @@ def run_optimization(
 
     compile_kwargs = {
         "trainset": train_examples,
+        "valset": val_examples,
         "max_bootstrapped_demos": optimizer_config.max_bootstrapped_demos,
         "max_labeled_demos": optimizer_config.max_labeled_demos,
     }
@@ -502,9 +501,11 @@ def run_optimization(
             f"Choose from: 'gepa', 'mipro', 'bootstrap'"
         )
 
-    logger.info(f"Optimizer config: {json.dumps(asdict(optimizer_config))}")
     logger.info(
-        f"Compile kwargs: {json.dumps({k: v for k, v in compile_kwargs.items() if k != 'trainset'})}"
+        f"Optimizer config: {json.dumps(asdict(optimizer_config), default=str)}"
+    )
+    logger.info(
+        f"Compile kwargs: {json.dumps({k: v for k, v in compile_kwargs.items() if k not in ['trainset', 'valset']}, default=str)}"
     )
     logger.info(
         f"Starting {optimizer_name} optimization with {len(train_examples)} train samples..."
@@ -542,10 +543,9 @@ def optimize_react_prompts(
     Returns:
         Dictionary with optimized prompts and metadata
     """
-    run_dir = setup_optimization_run(optimizer_config, agent_config, run_config)
+    setup_optimization_run(optimizer_config, agent_config, run_config)
     train_examples, val_examples, task_configs = load_and_prepare_data(task_config)
 
-    agent_config.log_dir = f"{run_dir}/eval_logs"
     agent_wrapper = ReactInspectAgent(agent_config)
     logger.info(f"Agent config: {json.dumps(asdict(agent_config))}")
 
@@ -555,7 +555,7 @@ def optimize_react_prompts(
         val_examples=val_examples,
         optimizer_config=optimizer_config,
         num_tasks=len(task_configs),
-        run_dir=run_dir,
+        run_dir=run_config.run_dir,
     )
 
     optimized_prediction = optimized_module(
@@ -583,6 +583,8 @@ def optimize_react_prompts(
             "task_paths": [tc.path for tc in task_configs],
             "task_split": task_config.task_split,
             "samples_per_task": task_config.samples_per_task,
+            "train_sample_ids": [ex.sample_id for ex in train_examples],
+            "val_sample_ids": [ex.sample_id for ex in val_examples],
         },
     }
 
@@ -592,12 +594,25 @@ def optimize_react_prompts(
 
     logger.info(f"Saved optimized prompts to: {output_path}")
 
+    # Also save sample IDs to run directory for easy reference
+    sample_ids_file = f"{run_config.run_dir}/sample_ids.json"
+    with open(sample_ids_file, "w") as f:
+        json.dump(
+            {
+                "train_sample_ids": [ex.sample_id for ex in train_examples],
+                "val_sample_ids": [ex.sample_id for ex in val_examples],
+            },
+            f,
+            indent=2,
+        )
+    logger.info(f"Saved sample IDs to: {sample_ids_file}")
+
     if val_examples:
         metric = agent_wrapper.create_logging_metric()
         val_score = metric(val_examples[0], optimized_prediction)
         logger.info(f"Validation score: {val_score:.4f}")
 
-    logger.info(f"Run directory: {run_dir}")
+    logger.info(f"Run directory: {run_config.run_dir}")
 
     return optimized_prompts
 
@@ -715,6 +730,12 @@ if __name__ == "__main__":
         help="Output file for optimized prompts",
     )
     output_group.add_argument(
+        "--base-dir",
+        type=str,
+        default=".dspy_cache",
+        help="Base directory for optimization runs",
+    )
+    output_group.add_argument(
         "--verbose-llm",
         action="store_true",
         help="Enable LLM call logging",
@@ -731,6 +752,10 @@ if __name__ == "__main__":
 
     agent_kwargs = {"max_steps": args.agent_max_steps}
 
+    # Create run directory upfront so we can configure log paths
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    run_dir = f"{args.base_dir}/run_{timestamp}"
+
     task_config = TaskLoadingConfig(
         config_path=args.config_path,
         task_split=task_split,
@@ -743,7 +768,7 @@ if __name__ == "__main__":
         eval_models=models,
         agent_kwargs=agent_kwargs,
         eval_timeout=args.eval_timeout,
-        log_dir=None,  # Will be set in optimize_react_prompts based on run_dir
+        log_dir=f"{run_dir}/eval_logs",
     )
 
     optimizer_config = OptimizerConfig(
@@ -757,9 +782,10 @@ if __name__ == "__main__":
     )
 
     run_config = RunConfig(
-        run_dir=None,  # Will be created in optimize_react_prompts
+        run_dir=run_dir,
         output_file=args.output,
         verbose_llm=args.verbose_llm,
+        base_dir=args.base_dir,
     )
 
     optimize_react_prompts(
