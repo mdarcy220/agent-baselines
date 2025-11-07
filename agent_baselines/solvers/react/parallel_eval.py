@@ -172,33 +172,12 @@ def _do_evaluation(
         #    obvious in the optimization results (not a silent failure).
         # 4. Prompt-specific failures mean it's a bad prompt we want to avoid anyway.
         if not eval_log.results or not eval_log.results.scores:
-            error_context = {
-                "sample_id": sample_id,
-                "task_path": task_path,
-                "model": model_name,
-                "system_message_preview": (
-                    system_message[:100] + "..."
-                    if len(system_message) > 100
-                    else system_message
-                ),
-                "continue_message_preview": (
-                    continue_message[:100] + "..."
-                    if len(continue_message) > 100
-                    else continue_message
-                ),
-            }
-            if eval_log.error:
-                logger.error(
-                    f"Evaluation failed for sample {sample_id} on model {model_name}: {eval_log.error}\n"
-                    f"Context: {error_context}\n"
-                    f"Returning score 0.0 for this model (will penalize this prompt in DSPy optimization)"
-                )
-            else:
-                logger.error(
-                    f"Evaluation returned no results/scores for sample {sample_id} on model {model_name}\n"
-                    f"Context: {error_context}\n"
-                    f"Returning score 0.0 for this model (will penalize this prompt in DSPy optimization)"
-                )
+            error_msg = (
+                eval_log.error if eval_log.error else "No results/scores returned"
+            )
+            logger.error(
+                f"Eval failed for {sample_id} on {model_name}: {error_msg}. Returning score 0.0"
+            )
             scores.append(0.0)
             continue
 
@@ -210,46 +189,19 @@ def _do_evaluation(
                 break
 
         if not scorer:
-            error_context = {
-                "sample_id": sample_id,
-                "task_path": task_path,
-                "model": model_name,
-                "requested_scorer": scorer_name,
-                "available_scorers": [s.name for s in eval_log.results.scores],
-                "system_message_preview": (
-                    system_message[:100] + "..."
-                    if len(system_message) > 100
-                    else system_message
-                ),
-            }
+            available = [s.name for s in eval_log.results.scores]
             logger.error(
-                f"Scorer '{scorer_name}' not found in results for sample {sample_id} on model {model_name}\n"
-                f"Context: {error_context}\n"
-                f"This likely indicates a configuration error (wrong scorer name) or scorer initialization failure.\n"
-                f"Returning score 0.0 for this model (will penalize this prompt in DSPy optimization)"
+                f"Scorer '{scorer_name}' not found for {sample_id} on {model_name}. "
+                f"Available: {available}. Returning score 0.0"
             )
             scores.append(0.0)
             continue
 
         if metric_name not in scorer.metrics:
-            error_context = {
-                "sample_id": sample_id,
-                "task_path": task_path,
-                "model": model_name,
-                "scorer_name": scorer_name,
-                "requested_metric": metric_name,
-                "available_metrics": list(scorer.metrics.keys()),
-                "system_message_preview": (
-                    system_message[:100] + "..."
-                    if len(system_message) > 100
-                    else system_message
-                ),
-            }
+            available = list(scorer.metrics.keys())
             logger.error(
-                f"Metric '{metric_name}' not found in scorer '{scorer_name}' for sample {sample_id} on model {model_name}\n"
-                f"Context: {error_context}\n"
-                f"This likely indicates a configuration error (wrong metric name) or metric computation failure.\n"
-                f"Returning score 0.0 for this model (will penalize this prompt in DSPy optimization)"
+                f"Metric '{metric_name}' not found in scorer '{scorer_name}' for {sample_id} on {model_name}. "
+                f"Available: {available}. Returning score 0.0"
             )
             scores.append(0.0)
             continue
@@ -311,25 +263,8 @@ def _run_eval_worker(args):
             import traceback
 
             error_msg = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
-
-            # Get prompts for error logging (safe access in case they're not in agent_params)
-            system_message_preview = (
-                agent_params.get("system_message", "<not available>")[:100] + "..."
-                if len(agent_params.get("system_message", "")) > 100
-                else agent_params.get("system_message", "<not available>")
-            )
-            continue_message_preview = (
-                agent_params.get("continue_message", "<not available>")[:100] + "..."
-                if len(agent_params.get("continue_message", "")) > 100
-                else agent_params.get("continue_message", "<not available>")
-            )
-
             logger.error(
-                f"Exception in eval worker for sample {sample_id} on task {task_path}\n"
-                f"Error details: {error_msg}\n"
-                f"System message preview: {system_message_preview}\n"
-                f"Continue message preview: {continue_message_preview}\n"
-                f"This error occurred after any retries (if configured) were exhausted."
+                f"Exception in eval worker for {sample_id} on {task_path}: {type(e).__name__}: {e}"
             )
             return ("error", error_msg)
 
@@ -403,25 +338,22 @@ def eval_in_subprocess(
             # Wait for result with timeout
             result_data = async_result.get(timeout=timeout)
 
-            actual_duration = time.perf_counter() - subprocess_start
             logger.info(
-                f"Subprocess completed for sample {sample_id} (took {actual_duration:.1f}s)"
+                f"Subprocess completed for sample {sample_id} (took {time.perf_counter() - subprocess_start:.1f}s)"
             )
 
         except mp.TimeoutError:
-            actual_duration = time.perf_counter() - subprocess_start
             pool.terminate()
             pool.join()
             raise TimeoutError(
-                f"Evaluation of sample {sample_id} timed out after {actual_duration:.0f}s "
+                f"Evaluation of sample {sample_id} timed out after {time.perf_counter() - subprocess_start:.0f}s "
                 f"(timeout setting: {timeout}s)"
             )
         except Exception as e:
-            actual_duration = time.perf_counter() - subprocess_start
             pool.terminate()
             pool.join()
             raise RuntimeError(
-                f"Subprocess failed for sample {sample_id} after {actual_duration:.1f}s: {e}"
+                f"Subprocess failed for sample {sample_id} after {time.perf_counter() - subprocess_start:.1f}s: {e}"
             )
 
     # Parse result

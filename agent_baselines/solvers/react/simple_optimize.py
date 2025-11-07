@@ -19,7 +19,7 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -174,6 +174,13 @@ class ReactInspectAgent:
                 **self.config.agent_kwargs,  # Merge in fixed kwargs (e.g., max_steps)
             }
 
+            # Create log file path for this evaluation
+            std_log_file = None
+            if self.config.log_dir:
+                os.makedirs(self.config.log_dir, exist_ok=True)
+                timestamp = int(time.time() * 1000)
+                std_log_file = f"{self.config.log_dir}/{sample_id}_{timestamp}.log"
+
             # Run evaluation in subprocess (enables parallelization)
             # This handles multi-model evaluation and returns averaged score
             score_value = eval_in_subprocess(
@@ -183,6 +190,7 @@ class ReactInspectAgent:
                 primary_metric=primary_metric,
                 agent_params=agent_params,
                 timeout=self.config.eval_timeout,
+                std_log_file=std_log_file,
             )
 
             return score_value
@@ -206,24 +214,6 @@ class ReactInspectAgent:
             """Metric with logging for visibility during optimization."""
             sample_id = example.sample_id
             task_name = example.task_name
-            task_path = example.task_path
-
-            # Log evaluation start
-            logger.info("=" * 80)
-            logger.info(f"DSPy Metric Evaluation:")
-            logger.info(f"  Sample: {sample_id}")
-            logger.info(f"  Task: {task_name} ({task_path})")
-            logger.info(f"  Models: {', '.join(self.config.eval_models)}")
-            logger.info(f"  Testing candidate prompts...")
-
-            # Optional: write detailed logs to file
-            if self.config.log_dir:
-                os.makedirs(self.config.log_dir, exist_ok=True)
-                timestamp = int(time.time() * 1000)
-                std_log_file = f"{self.config.log_dir}/{sample_id}_{timestamp}.log"
-                logger.info(f"  (Detailed logs → {std_log_file})")
-
-            logger.info("=" * 80)
 
             try:
                 # Call base metric for evaluation
@@ -231,19 +221,13 @@ class ReactInspectAgent:
                     example, prediction, trace, pred_name, pred_trace
                 )
 
-                # Log success
-                logger.info(
-                    f"✓ Sample {sample_id} completed: avg score = {score_value:.4f}\n"
-                )
-
+                # Log result concisely
+                logger.info(f"✓ {sample_id} ({task_name}): {score_value:.4f}")
                 return score_value
 
             except Exception as e:
                 # Log failure
-                logger.info(f"✗ Sample {sample_id} failed: {e}\n")
-                logger.error(
-                    f"Failed to evaluate sample {sample_id} on task {task_path}: {e}"
-                )
+                logger.info(f"✗ {sample_id} ({task_name}): {e}")
                 raise
 
         return logging_metric
@@ -380,9 +364,7 @@ def setup_optimization_run(
         run_dir = f".dspy_cache/run_{timestamp}"
     os.makedirs(run_dir, exist_ok=True)
 
-    logger.info("=" * 80)
-    logger.info(f"RUN DIRECTORY: {run_dir}")
-    logger.info("=" * 80)
+    logger.info(f"Run directory: {run_dir}")
 
     # Configure DSPy
     optimizer_model = optimizer_config.optimizer_model or agent_config.eval_models[0]
@@ -402,10 +384,6 @@ def load_and_prepare_data(
     Returns:
         Tuple of (train_examples, val_examples, task_configs)
     """
-    logger.info("\n" + "=" * 80)
-    logger.info("PHASE 1: Loading task data")
-    logger.info("=" * 80)
-
     # Load task configurations
     task_configs = load_tasks_from_config(
         config_path=task_config.config_path,
@@ -413,23 +391,24 @@ def load_and_prepare_data(
         task_paths=task_config.tasks,
     )
 
-    logger.info(f"Loaded {len(task_configs)} task configs")
-    for tc in task_configs:
-        logger.info(f"  - {tc.name} ({tc.path})")
+    logger.info(
+        f"Loading {len(task_configs)} tasks: {', '.join(tc.name for tc in task_configs)}"
+    )
 
     # Load samples from tasks
     sample_tuples = load_samples_from_tasks(
         task_configs=task_configs,
         samples_per_task=task_config.samples_per_task,
     )
-    logger.info(f"Loaded {len(sample_tuples)} total samples across all tasks")
 
     # Create DSPy examples and split train/val
     train_examples, val_examples = create_mixed_dspy_examples(
         sample_tuples=sample_tuples,
         train_ratio=task_config.train_ratio,
     )
-    logger.info(f"Split: {len(train_examples)} train, {len(val_examples)} val")
+    logger.info(
+        f"Loaded {len(sample_tuples)} samples, split into {len(train_examples)} train / {len(val_examples)} val"
+    )
 
     # Interleave training examples (critical for multi-task optimization)
     # MIPRO's dataset observation looks at first ~10 examples, so we need
@@ -455,10 +434,6 @@ def run_optimization(
     Returns:
         Tuple of (optimized_module, optimizer_name)
     """
-    logger.info("\n" + "=" * 80)
-    logger.info("PHASE 3: Configuring optimizer")
-    logger.info("=" * 80)
-
     # Create metric function (with logging for visibility)
     metric = agent_wrapper.create_logging_metric()
 
@@ -523,14 +498,6 @@ def run_optimization(
         )
         compile_kwargs["minibatch"] = True
 
-        # Log MIPRO configuration
-        logger.info(f"MIPRO num_trials: {num_trials} (DSPy formula)")
-        logger.info(
-            f"MIPRO minibatch_size: {compile_kwargs['minibatch_size']} "
-            f"(min of train={len(train_examples)}, val={len(val_examples)}, "
-            f"desired={desired_minibatch} [{num_tasks} tasks × {SAMPLES_PER_TASK_FOR_MINIBATCH}])"
-        )
-
         if len(val_examples) < desired_minibatch:
             logger.warning(
                 f"Validation set size ({len(val_examples)}) limits minibatch size. "
@@ -547,18 +514,13 @@ def run_optimization(
             f"Choose from: 'gepa', 'mipro', 'bootstrap'"
         )
 
-    logger.info(f"Optimizer: {optimizer_name}")
-    logger.info(f"  Candidates: {optimizer_config.num_candidates}")
-    logger.info(f"  Temperature: {optimizer_config.temperature}")
-    logger.info(f"Compile kwargs: {list(compile_kwargs.keys())}")
-
-    logger.info("\n" + "=" * 80)
-    logger.info("PHASE 4: Running optimization")
-    logger.info("=" * 80)
-
-    logger.info(f"Training samples: {len(train_examples)}")
-    logger.info(f"Validation samples: {len(val_examples)}")
-    logger.info("Starting DSPy optimizer.compile()...")
+    logger.info(f"Optimizer config: {json.dumps(asdict(optimizer_config))}")
+    logger.info(
+        f"Compile kwargs: {json.dumps({k: v for k, v in compile_kwargs.items() if k != 'trainset'})}"
+    )
+    logger.info(
+        f"Starting {optimizer_name} optimization with {len(train_examples)} train samples..."
+    )
 
     # Get the DSPy module to optimize from agent wrapper
     react_prompts = agent_wrapper.get_tunable_module()
@@ -566,7 +528,7 @@ def run_optimization(
     # Run optimization
     optimized_module = optimizer.compile(react_prompts, **compile_kwargs)
 
-    logger.info("Optimization complete!")
+    logger.info("Optimization complete")
 
     return optimized_module, optimizer_name
 
@@ -602,20 +564,9 @@ def optimize_react_prompts(
     train_examples, val_examples, task_configs = load_and_prepare_data(task_config)
 
     # Create agent wrapper
-    logger.info("\n" + "=" * 80)
-    logger.info("PHASE 2: Creating agent wrapper")
-    logger.info("=" * 80)
-
-    agent_config.log_dir = (
-        f"{run_dir}/eval_logs"  # Update log_dir now that we have run_dir
-    )
+    agent_config.log_dir = f"{run_dir}/eval_logs"
     agent_wrapper = ReactInspectAgent(agent_config)
-
-    logger.info("Agent wrapper created")
-    logger.info(f"  Eval models: {agent_config.eval_models}")
-    logger.info(f"  Agent kwargs: {agent_config.agent_kwargs}")
-    logger.info(f"  Eval timeout: {agent_config.eval_timeout}s")
-    logger.info(f"  Eval logs: {agent_config.log_dir}")
+    logger.info(f"Agent config: {json.dumps(asdict(agent_config))}")
 
     # Run optimization
     optimized_module, optimizer_name = run_optimization(
@@ -626,14 +577,6 @@ def optimize_react_prompts(
         num_tasks=len(task_configs),
         run_dir=run_dir,
     )
-
-    # ========================================
-    # Phase 5: Save and Evaluate Results
-    # ========================================
-
-    logger.info("\n" + "=" * 80)
-    logger.info("PHASE 5: Saving results")
-    logger.info("=" * 80)
 
     # Generate final optimized prompts
     optimized_prediction = optimized_module(
@@ -672,23 +615,14 @@ def optimize_react_prompts(
         json.dump(optimized_prompts, f, indent=2)
 
     logger.info(f"Saved optimized prompts to: {output_path}")
-    logger.info(f"\nOptimized System Message:\n{optimized_prediction.system_message}")
-    logger.info(
-        f"\nOptimized Continue Message:\n{optimized_prediction.continue_message}"
-    )
 
     # Validate on first val example
     if val_examples:
-        logger.info("\nValidating on first val example...")
         metric = agent_wrapper.create_logging_metric()
         val_score = metric(val_examples[0], optimized_prediction)
         logger.info(f"Validation score: {val_score:.4f}")
 
-    logger.info("\n" + "=" * 80)
-    logger.info("OPTIMIZATION COMPLETE")
-    logger.info("=" * 80)
     logger.info(f"Run directory: {run_dir}")
-    logger.info(f"Output file: {output_path}")
 
     return optimized_prompts
 
