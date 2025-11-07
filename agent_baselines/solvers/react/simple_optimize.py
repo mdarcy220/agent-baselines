@@ -132,11 +132,16 @@ class ReactInspectAgent:
         Returns a pure evaluation function that:
         1. Extracts prompts from DSPy prediction
         2. Extracts metadata from DSPy example
-        3. Runs eval_in_subprocess with those inputs
-        4. Returns averaged score across models
+        3. Formulates agent_params dict with all parameters for the ReAct agent
+        4. Runs eval_in_subprocess with those inputs
+        5. Returns averaged score across models
 
         The metric has no side effects (no logging, no I/O) - it's just
         evaluation logic. This makes it testable and reusable.
+
+        Design principle: The agent wrapper is responsible for knowing what
+        parameters its specific agent type needs and packaging them into the
+        agent_params dict. This makes it easy to add new agent types later.
         """
 
         def metric(example, prediction, trace=None, pred_name=None, pred_trace=None):
@@ -161,17 +166,23 @@ class ReactInspectAgent:
             task_path = example.task_path
             primary_metric = example.primary_metric
 
+            # Formulate agent_params dict with all parameters for the ReAct agent
+            # This includes the optimized prompts and any fixed agent kwargs
+            agent_params = {
+                "system_message": system_message,
+                "continue_message": continue_message,
+                **self.config.agent_kwargs,  # Merge in fixed kwargs (e.g., max_steps)
+            }
+
             # Run evaluation in subprocess (enables parallelization)
             # This handles multi-model evaluation and returns averaged score
             score_value = eval_in_subprocess(
                 sample_id=sample_id,
-                system_message=system_message,
-                continue_message=continue_message,
                 model_names=self.config.eval_models,
                 task_path=task_path,
                 primary_metric=primary_metric,
+                agent_params=agent_params,
                 timeout=self.config.eval_timeout,
-                agent_kwargs=self.config.agent_kwargs,
             )
 
             return score_value

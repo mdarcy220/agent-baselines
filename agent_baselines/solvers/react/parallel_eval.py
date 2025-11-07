@@ -3,6 +3,11 @@
 This module provides a subprocess wrapper around inspect_ai.eval() to enable
 parallel evaluation when using DSPy optimizers. Each eval runs in a separate
 subprocess to avoid inspect_ai's concurrent call restriction.
+
+Design: eval_in_subprocess takes a generic agent_params dict to support
+different agent types. The agent wrapper (e.g., ReactInspectAgent) is
+responsible for constructing the appropriate agent_params dict for its
+specific agent type.
 """
 
 import logging
@@ -71,23 +76,22 @@ def redirect_output(std_log_file: str | None):
 
 def _do_evaluation(
     sample_id: str,
-    system_message: str,
-    continue_message: str,
     model_names: list[str],
     task_path: str,
     primary_metric: str,
-    agent_kwargs: dict | None = None,
+    agent_params: dict,
 ) -> tuple[str, float, str, str]:
     """Perform the actual evaluation work.
 
     Args:
         sample_id: ID of the sample to evaluate
-        system_message: System message prompt
-        continue_message: Continue message prompt
         model_names: List of models to evaluate on
         task_path: Task path (e.g., "astabench/sqa_dev")
         primary_metric: Primary metric to extract (format: "scorer_name/metric_name")
-        agent_kwargs: Additional keyword arguments to pass to the agent solver (e.g., {"max_steps": 10})
+        agent_params: Agent-specific parameters dict. For ReAct agents, this should include:
+            - system_message: System message prompt
+            - continue_message: Continue message prompt
+            - Any additional kwargs for the agent solver (e.g., max_steps)
 
     Returns:
         Tuple of ("success", avg_score_value, sample_id, task_path)
@@ -95,8 +99,6 @@ def _do_evaluation(
     Raises:
         RuntimeError: If all models fail (systemic issue)
     """
-    if agent_kwargs is None:
-        agent_kwargs = {}
     print(
         f"Starting eval worker for sample {sample_id} on task {task_path}",
         file=sys.stderr,
@@ -113,6 +115,18 @@ def _do_evaluation(
     metric_parts = primary_metric.split("/")
     assert len(metric_parts) == 2, f"Invalid primary_metric format: {primary_metric}"
     scorer_name, metric_name = metric_parts
+
+    # Extract agent-specific parameters from agent_params dict
+    # For ReAct agents, we expect system_message, continue_message, and any additional kwargs
+    system_message = agent_params["system_message"]
+    continue_message = agent_params["continue_message"]
+
+    # Additional kwargs (everything except system_message and continue_message)
+    agent_kwargs = {
+        k: v
+        for k, v in agent_params.items()
+        if k not in ["system_message", "continue_message"]
+    }
 
     # Create solver with candidate prompts (without tools - task provides them)
     agent_solver = create_agent_with_dspy_prompts(
@@ -263,8 +277,8 @@ def _run_eval_worker(args):
     """Worker function that runs in a subprocess via Pool.map.
 
     Args:
-        args: Tuple of (sample_id, system_message, continue_message, model_names,
-              task_path, primary_metric, std_log_file, agent_kwargs)
+        args: Tuple of (sample_id, model_names, task_path, primary_metric,
+              agent_params, std_log_file)
 
     Returns:
         Tuple of ("success", avg_score_value, sample_id, task_path) or
@@ -272,25 +286,21 @@ def _run_eval_worker(args):
     """
     (
         sample_id,
-        system_message,
-        continue_message,
         model_names,
         task_path,
         primary_metric,
+        agent_params,
         std_log_file,
-        agent_kwargs,
     ) = args
 
     with redirect_output(std_log_file):
         try:
             return _do_evaluation(
                 sample_id=sample_id,
-                system_message=system_message,
-                continue_message=continue_message,
                 model_names=model_names,
                 task_path=task_path,
                 primary_metric=primary_metric,
-                agent_kwargs=agent_kwargs,
+                agent_params=agent_params,
             )
         except Exception as e:
             # Return exception info
@@ -301,11 +311,24 @@ def _run_eval_worker(args):
             import traceback
 
             error_msg = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+
+            # Get prompts for error logging (safe access in case they're not in agent_params)
+            system_message_preview = (
+                agent_params.get("system_message", "<not available>")[:100] + "..."
+                if len(agent_params.get("system_message", "")) > 100
+                else agent_params.get("system_message", "<not available>")
+            )
+            continue_message_preview = (
+                agent_params.get("continue_message", "<not available>")[:100] + "..."
+                if len(agent_params.get("continue_message", "")) > 100
+                else agent_params.get("continue_message", "<not available>")
+            )
+
             logger.error(
                 f"Exception in eval worker for sample {sample_id} on task {task_path}\n"
                 f"Error details: {error_msg}\n"
-                f"System message preview: {system_message[:100]}...\n"
-                f"Continue message preview: {continue_message[:100]}...\n"
+                f"System message preview: {system_message_preview}\n"
+                f"Continue message preview: {continue_message_preview}\n"
                 f"This error occurred after any retries (if configured) were exhausted."
             )
             return ("error", error_msg)
@@ -313,27 +336,30 @@ def _run_eval_worker(args):
 
 def eval_in_subprocess(
     sample_id: str,
-    system_message: str,
-    continue_message: str,
     model_names: list[str],
     task_path: str,
     primary_metric: str,
+    agent_params: dict,
     timeout: int = 600,
     std_log_file: str | None = None,
-    agent_kwargs: dict | None = None,
 ) -> float:
     """Run inspect_ai.eval() in an isolated subprocess with multi-model support.
 
+    This function takes a generic agent_params dict to allow different agent types
+    to pass their specific parameters. The agent wrapper is responsible for
+    constructing the appropriate agent_params dict for its agent type.
+
     Args:
         sample_id: ID of the sample to evaluate
-        system_message: System message prompt to use
-        continue_message: Continue message prompt to use
         model_names: List of models to evaluate on (scores will be averaged)
         task_path: Task path (e.g., "astabench/sqa_dev")
         primary_metric: Primary metric to extract (e.g., "global_avg/mean")
+        agent_params: Agent-specific parameters dict. For ReAct agents, this should include:
+            - system_message: System message prompt
+            - continue_message: Continue message prompt
+            - Any additional kwargs for the agent solver (e.g., max_steps)
         timeout: Timeout in seconds (default: 600)
         std_log_file: Optional path to redirect subprocess output (default: None)
-        agent_kwargs: Additional keyword arguments to pass to the agent solver (e.g., {"max_steps": 10})
 
     Returns:
         Average score across all models for this sample
@@ -342,8 +368,6 @@ def eval_in_subprocess(
         TimeoutError: If evaluation exceeds timeout
         RuntimeError: If evaluation fails
     """
-    if agent_kwargs is None:
-        agent_kwargs = {}
     # Use Pool.apply() to run worker in subprocess
     # This properly handles return values without needing Queue
 
@@ -368,13 +392,11 @@ def eval_in_subprocess(
                 args=(
                     (
                         sample_id,
-                        system_message,
-                        continue_message,
                         model_names,
                         task_path,
                         primary_metric,
+                        agent_params,
                         std_log_file,
-                        agent_kwargs,
                     ),
                 ),
             )

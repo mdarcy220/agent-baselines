@@ -385,17 +385,22 @@ def create_metric_function(
         )
 
         # Run eval in subprocess (enables parallelization)
+        # Formulate agent_params dict with all parameters for the ReAct agent
+        agent_params = {
+            "system_message": system_message,
+            "continue_message": continue_message,
+            **agent_config,  # Merge in fixed agent kwargs
+        }
+
         try:
             score_value = eval_in_subprocess(
                 sample_id=sample_id,
-                system_message=system_message,
-                continue_message=continue_message,
                 model_names=model_names,
                 task_path=task_path,
                 primary_metric=primary_metric,
+                agent_params=agent_params,
                 timeout=eval_timeout,
                 std_log_file=std_log_file,
-                agent_kwargs=agent_config,
             )
 
             # Print result
