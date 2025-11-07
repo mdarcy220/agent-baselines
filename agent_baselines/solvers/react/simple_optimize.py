@@ -29,13 +29,13 @@ from dspy.utils.callback import BaseCallback
 
 from agent_baselines.solvers.react.basic_agent import DEFAULT_SUBMIT_NAME
 from agent_baselines.solvers.react.dspy_agent import DSPyReActPrompts
-from agent_baselines.solvers.react.optimize import (
+from agent_baselines.solvers.react.parallel_eval import eval_in_subprocess
+from agent_baselines.solvers.react.task_loader import (
     create_mixed_dspy_examples,
     interleave_tasks,
     load_samples_from_tasks,
     load_tasks_from_config,
 )
-from agent_baselines.solvers.react.parallel_eval import eval_in_subprocess
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
