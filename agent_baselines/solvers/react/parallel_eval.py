@@ -4,10 +4,9 @@ This module provides a subprocess wrapper around inspect_ai.eval() to enable
 parallel evaluation when using DSPy optimizers. Each eval runs in a separate
 subprocess to avoid inspect_ai's concurrent call restriction.
 
-Design: eval_in_subprocess takes a generic agent_params dict to support
-different agent types. The agent wrapper (e.g., ReactInspectAgent) is
-responsible for constructing the appropriate agent_params dict for its
-specific agent type.
+Design: Uses inspect_ai's solver loading mechanism to dynamically load any
+solver from a path. The agent_params dict is passed as kwargs to the solver
+factory function, enabling support for different agent types.
 """
 
 import logging
@@ -79,6 +78,7 @@ def _do_evaluation(
     model_names: list[str],
     task_path: str,
     primary_metric: str,
+    solver_path: str,
     agent_params: dict,
 ) -> tuple[str, float, str, str]:
     """Perform the actual evaluation work.
@@ -88,10 +88,8 @@ def _do_evaluation(
         model_names: List of models to evaluate on
         task_path: Task path (e.g., "astabench/sqa_dev")
         primary_metric: Primary metric to extract (format: "scorer_name/metric_name")
-        agent_params: Agent-specific parameters dict. For ReAct agents, this should include:
-            - system_message: System message prompt
-            - continue_message: Continue message prompt
-            - Any additional kwargs for the agent solver (e.g., max_steps)
+        solver_path: Path to solver (e.g., "agent_baselines/solvers/react/dspy_agent.py@create_agent_with_dspy_prompts")
+        agent_params: Parameters to pass to the solver factory as kwargs
 
     Returns:
         Tuple of ("success", avg_score_value, sample_id, task_path)
@@ -105,10 +103,7 @@ def _do_evaluation(
     )
     # Import inside worker to ensure fresh state
     from inspect_ai import eval as inspect_eval
-
-    from agent_baselines.solvers.react.dspy_agent import (
-        create_agent_with_dspy_prompts,
-    )
+    from inspect_ai._eval.loader import SolverSpec, solver_from_spec
 
     # Parse primary_metric format: "scorer_name/metric_name"
     # E.g., "global_avg/mean" or "score_discoverybench/mean"
@@ -116,23 +111,10 @@ def _do_evaluation(
     assert len(metric_parts) == 2, f"Invalid primary_metric format: {primary_metric}"
     scorer_name, metric_name = metric_parts
 
-    # Extract agent-specific parameters from agent_params dict
-    # For ReAct agents, we expect system_message, continue_message, and any additional kwargs
-    system_message = agent_params["system_message"]
-    continue_message = agent_params["continue_message"]
-
-    agent_kwargs = {
-        k: v
-        for k, v in agent_params.items()
-        if k not in ["system_message", "continue_message"]
-    }
-
-    # Create solver with candidate prompts (without tools - task provides them)
-    agent_solver = create_agent_with_dspy_prompts(
-        system_message_text=system_message,
-        continue_message_text=continue_message,
-        **agent_kwargs,
-    )
+    # Load solver dynamically using inspect_ai's solver loading mechanism
+    # This allows any solver to be used, not just ReAct
+    solver_spec = SolverSpec(solver=solver_path, args=agent_params)
+    agent_solver = solver_from_spec(solver_spec)
 
     scores = []
     for model_name in model_names:
@@ -223,7 +205,7 @@ def _run_eval_worker(args):
 
     Args:
         args: Tuple of (sample_id, model_names, task_path, primary_metric,
-              agent_params, std_log_file)
+              solver_path, agent_params, std_log_file)
 
     Returns:
         Tuple of ("success", avg_score_value, sample_id, task_path) or
@@ -234,6 +216,7 @@ def _run_eval_worker(args):
         model_names,
         task_path,
         primary_metric,
+        solver_path,
         agent_params,
         std_log_file,
     ) = args
@@ -245,6 +228,7 @@ def _run_eval_worker(args):
                 model_names=model_names,
                 task_path=task_path,
                 primary_metric=primary_metric,
+                solver_path=solver_path,
                 agent_params=agent_params,
             )
         except Exception as e:
@@ -267,25 +251,22 @@ def eval_in_subprocess(
     model_names: list[str],
     task_path: str,
     primary_metric: str,
+    solver_path: str,
     agent_params: dict,
     timeout: int = 600,
     std_log_file: str | None = None,
 ) -> float:
     """Run inspect_ai.eval() in an isolated subprocess with multi-model support.
 
-    This function takes a generic agent_params dict to allow different agent types
-    to pass their specific parameters. The agent wrapper is responsible for
-    constructing the appropriate agent_params dict for its agent type.
+    Uses inspect_ai's dynamic solver loading to support any solver type.
 
     Args:
         sample_id: ID of the sample to evaluate
         model_names: List of models to evaluate on (scores will be averaged)
         task_path: Task path (e.g., "astabench/sqa_dev")
         primary_metric: Primary metric to extract (e.g., "global_avg/mean")
-        agent_params: Agent-specific parameters dict. For ReAct agents, this should include:
-            - system_message: System message prompt
-            - continue_message: Continue message prompt
-            - Any additional kwargs for the agent solver (e.g., max_steps)
+        solver_path: Path to solver (e.g., "agent_baselines/solvers/react/dspy_agent.py@create_agent_with_dspy_prompts")
+        agent_params: Parameters to pass to the solver factory as kwargs
         timeout: Timeout in seconds (default: 600)
         std_log_file: Optional path to redirect subprocess output (default: None)
 
@@ -323,6 +304,7 @@ def eval_in_subprocess(
                         model_names,
                         task_path,
                         primary_metric,
+                        solver_path,
                         agent_params,
                         std_log_file,
                     ),

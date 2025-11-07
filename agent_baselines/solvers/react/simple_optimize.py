@@ -118,6 +118,11 @@ class ReactInspectAgent:
     separately via optional wrapper to maintain separation of concerns.
     """
 
+    # Solver path for ReAct agent with DSPy-optimizable prompts
+    solver_path = (
+        "agent_baselines/solvers/react/dspy_agent.py@create_agent_with_dspy_prompts"
+    )
+
     def __init__(self, config: ReactAgentConfig):
         """Initialize agent wrapper with fixed configuration.
 
@@ -165,8 +170,8 @@ class ReactInspectAgent:
             primary_metric = example.primary_metric
 
             agent_params = {
-                "system_message": system_message,
-                "continue_message": continue_message,
+                "system_message_text": system_message,
+                "continue_message_text": continue_message,
                 **self.config.agent_kwargs,
             }
 
@@ -183,6 +188,7 @@ class ReactInspectAgent:
                 model_names=self.config.eval_models,
                 task_path=task_path,
                 primary_metric=primary_metric,
+                solver_path=self.solver_path,
                 agent_params=agent_params,
                 timeout=self.config.eval_timeout,
                 std_log_file=std_log_file,
