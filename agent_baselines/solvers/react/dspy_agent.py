@@ -1,7 +1,17 @@
-"""DSPy-compatible ReAct agent for prompt optimization.
+"""DSPy-compatible ReAct agent with optimizable prompts.
 
 This module provides DSPy signatures and a module for optimizing the ReAct agent's
-prompts using DSPy optimizers like GEPA or MIPROv2.
+prompts using DSPy optimizers like MIPRO or GEPA.
+
+The key design is that signature instructions (docstrings) ARE the agent prompts.
+DSPy optimizers modify these instructions based on agent performance, allowing
+direct optimization of the prompts that the agent sees.
+
+Architecture:
+1. Signature instructions define the agent prompts
+2. DSPy optimizers modify the instructions based on agent performance
+3. After optimization, extract the optimized instructions as final prompts
+4. Use them directly as the agent's system_message and continue_message
 """
 
 import dspy
@@ -12,105 +22,107 @@ from agent_baselines.solvers.react.basic_agent import (
     basic_agent,
 )
 
+# Note: docstrings of these signatures are seeded from the original
+# basic_agent.py prompts (which in turn are seeded from inspect_ai)
 
-class SystemMessageSignature(dspy.Signature):
-    """Generate a system message for a ReAct agent solving diverse research and analysis tasks.
 
-    The agent will receive a specific task (which may be a research question, data analysis problem,
-    math calculation, coding challenge, or document analysis task) and must use available tools
-    to solve it. Different task types require different approaches:
-
-    - Research questions: Use search tools to find and cite relevant sources
-    - Math/data problems: Use calculation or code execution tools
-    - Multi-step problems: Break down into subtasks and use tools iteratively
-    - Document analysis: Read and extract information from provided documents
-
-    The system message should:
-    - Clearly explain the task goal from task_description (which includes the actual question)
-    - Describe when and how to use available tools (tools are provided by the task environment)
-    - Emphasize the importance of calling submit_function_name when done with the final answer
-    - Encourage step-by-step reasoning before taking actions
-    - Be concise but complete - avoid unnecessary verbosity
+class AgentSystemPromptSignature(dspy.Signature):
     """
+    You are a helpful assistant attempting to submit the correct answer. You have
+    several functions available to help with finding the answer. Each message may
+    may perform one function call. You will see the result of the function right
+    after sending the message. If you need to perform multiple actions, you can
+    always send more messages with subsequent function calls. Do some reasoning
+    before your actions, describing what function calls you are going to use and
+    how they fit into your plan.
 
-    task_description = dspy.InputField(
-        desc="Complete description of the specific task to solve, including the actual question or problem statement. Format: 'Task: [task_name]\\n\\nQuestion: [actual question]'"
-    )
-    submit_function_name = dspy.InputField(
-        desc="Name of the function the agent must call to submit the final answer (e.g., 'submit_answer', 'submit_code'). This function will be available as a tool."
-    )
-    system_message = dspy.OutputField(
-        desc="Complete system message that prepares the agent to solve this specific task. Should be clear, actionable, and tailored to the task type."
-    )
+    When you have completed the task and have an answer, call the {submit}()
+    function to report it."""
+
+    # These fields satisfy DSPy's signature requirements
+    # The signature instructions (docstring above) are what get optimized
+    task = dspy.InputField(desc="The specific task instructions")
+    response = dspy.OutputField(desc="The agent's solution to the task")
 
 
-class ContinueMessageSignature(dspy.Signature):
-    """Generate a brief message to encourage the agent to continue working when it hasn't made a tool call.
+class AgentContinuePromptSignature(dspy.Signature):
+    """Please proceed to the next step using your best judgement.  Remember to submit when the task is complete."""
 
-    This message helps the agent:
-    - Stay on track toward completing the task
-    - Remember to use tools when needed to make progress
-    - Know when it's time to submit the final answer
-    - Avoid getting stuck or giving up prematurely
-
-    The continue message should be:
-    - Brief (1-2 sentences)
-    - Motivating but not pushy
-    - Remind the agent of its goal without being repetitive
-    - Generic enough to work across different task types
-    """
-
-    continue_message = dspy.OutputField(
-        desc="Brief, motivating message (1-2 sentences) that reminds the agent to proceed with the task and use tools or submit when ready"
-    )
+    # No input or output fields here; this is just a message to encourage the
+    # agent to keep working if it doesn't call a tool for one of its steps.
 
 
 class DSPyReActPrompts(dspy.Module):
-    """DSPy module that generates optimized prompts for the ReAct agent."""
+    """DSPy module that provides optimizable agent prompts via signature instructions.
+
+    This module:
+    1. Defines prompts as signature instructions (docstrings)
+    2. Creates predictors so DSPy optimizers can modify the signatures
+    3. Returns the current signature instructions in forward()
+    4. After optimization, provides optimized instructions for use as agent prompts
+
+    DSPy optimizers (like MIPRO) modify the signature instructions based on
+    agent performance metrics, directly optimizing the prompts that the agent sees.
+    """
 
     def __init__(self):
         super().__init__()
-        self.system_message_generator = dspy.ChainOfThought(SystemMessageSignature)
-        self.continue_message_generator = dspy.ChainOfThought(ContinueMessageSignature)
+
+        # Create predictors so DSPy optimizers can access and modify their signatures
+        # The signature instructions (docstrings) are what get optimized
+        # Note: These predictors are never actually called - we just extract their instructions
+        self.system_prompt = dspy.Predict(AgentSystemPromptSignature)
+        self.continue_prompt = dspy.Predict(AgentContinuePromptSignature)
 
     def forward(
-        self, task_description: str, submit_function_name: str = DEFAULT_SUBMIT_NAME
+        self,
+        task_description: str = "",
+        submit_function_name: str = DEFAULT_SUBMIT_NAME,
     ):
-        """Generate optimized prompts for the ReAct agent.
+        """Return current signature instructions as agent prompts.
+
+        This method extracts the signature instructions (which DSPy optimizers modify)
+        and returns them as the agent's system_message and continue_message.
+
+        Note on Bootstrap Demonstrations:
+        ---------------------------------
+        This implementation does NOT support DSPy's bootstrap demonstrations because
+        forward() returns the same output (signature instructions) for every input.
+        The actual agent execution happens in eval_in_subprocess() within the metric
+        function, disconnected from this module's forward().
+
+        To make bootstrap work, forward() would need to:
+        1. Call eval_in_subprocess() to actually run the agent
+        2. Return the eval file path (not just the answer) along with the extracted answer
+        3. Have the metric read the score from the eval file instead of re-running eval
+
+        This would avoid redundant evals, but is architecturally awkward (forward()
+        would see eval file paths, metric would need to handle both fresh evals and
+        cached results). Instead, we default max_bootstrapped_demos=0 and rely on
+        MIPRO's instruction optimization based on final scores alone.
 
         Args:
-            task_description: The specific task/question the agent needs to solve.
-                             Format: "Task: [task_name]\\n\\nQuestion: [actual question]"
-            submit_function_name: Function name for submitting the final answer
+            task_description: Not used in direct optimization (kept for API compatibility
+                with DSPy's example format from task_loader.py)
+            submit_function_name: Name of submit function to inject into prompt
 
         Returns:
-            Prediction with 'system_message' and 'continue_message' fields
+            Prediction with 'system_message' and 'continue_message' fields containing
+            the current signature instructions
         """
-        # Generate task-specific system message
-        # The system message sets up the agent's understanding of:
-        # - What the specific task is asking for (from task_description)
-        # - What tools are available (provided by the task environment, not specified here)
-        # - When to call submit_function_name with the final answer
-        # - How to approach the problem (reasoning, tool use, etc.)
-        #
-        # This is generated using ChainOfThought, so DSPy optimizers can see
-        # the reasoning process during bootstrap/optimization
-        system_result = self.system_message_generator(
-            task_description=task_description,
-            submit_function_name=submit_function_name,
-        )
+        # Extract current instructions from signatures
+        # After optimization, these will contain the optimized instructions
+        system_instructions = self.system_prompt.signature.instructions
+        continue_instructions = self.continue_prompt.signature.instructions
 
-        # Generate continuation prompt for when agent stalls
-        # This helps the agent recover when it fails to make progress after
-        # using a tool or when it seems stuck. The continue message should:
-        # - Not be overly repetitive (agent sees it multiple times)
-        # - Encourage forward progress without being pushy
-        # - Be generic enough to work across diverse task types
-        continue_result = self.continue_message_generator()
+        # Inject submit_function_name into system message to support different submit names
+        system_message_text = system_instructions.replace(
+            "submit function", f"{submit_function_name}() function"
+        ).replace("call the submit", f"call the {submit_function_name}()")
 
         return dspy.Prediction(
-            system_message=system_result.system_message,
-            continue_message=continue_result.continue_message,
+            system_message=system_message_text,
+            continue_message=continue_instructions,
         )
 
 
@@ -121,11 +133,11 @@ def create_agent_with_dspy_prompts(
     max_steps: int = 10,
     **kwargs,
 ) -> Solver:
-    """Create a basic_agent solver with custom DSPy-optimized prompts.
+    """Create a basic_agent solver with DSPy-optimized prompts.
 
     Args:
-        system_message_text: The optimized system message
-        continue_message_text: The optimized continue message
+        system_message_text: The system message prompt
+        continue_message_text: The continue message prompt
         max_steps: Maximum number of agent steps
         **kwargs: Additional arguments to pass to basic_agent
 

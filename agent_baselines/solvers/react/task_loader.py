@@ -140,16 +140,17 @@ def create_mixed_dspy_examples(
     """Convert multi-task samples to DSPy examples and split into train/val.
 
     Each DSPy example contains:
-    - task_description: Actual task content including the question/problem from sample.input
+    - task_description: Generic task description (same for all samples)
     - submit_function_name: Name of the submit function
+    - question: The actual question/problem from sample.input
     - sample: Full Sample object (for metric evaluation)
     - sample_id: The ID of the sample (for running eval on just this sample)
     - task_path: Path to the task (e.g., "astabench/sqa_dev")
     - primary_metric: Primary metric for this task (e.g., "global_avg/mean")
     - task_name: Human-readable task name
 
-    This provides optimizers with actual task content they need for bootstrapping
-    and instruction generation, while still using sample_id for evaluation.
+    The question field is available for DSPy optimizers to understand the dataset,
+    while evaluation uses sample_id to run the full agent on individual samples.
 
     Args:
         sample_tuples: List of (task_path, primary_metric, task_name, sample) tuples
@@ -183,8 +184,8 @@ def create_mixed_dspy_examples(
     def create_examples(tuples):
         examples = []
         for task_path, primary_metric, task_name, sample in tuples:
-            # Use generic task description (same for all) to ensure universal prompts
-            # Real questions stored as metadata for dataset summary observation
+            # task_description is generic (same for all samples)
+            # question field contains the actual question for DSPy's dataset analysis
             example = dspy.Example(
                 task_description=task_description,
                 submit_function_name=submit_function_name,

@@ -8,11 +8,20 @@ Clean architecture with clear separation of concerns:
 5. CLI - Wire everything together
 
 Key design principles:
-- Import data loading utilities from optimize.py (don't duplicate)
+- Import data loading utilities from task_loader.py
 - Use parallel_eval.py for subprocess-based evaluation
 - Keep metric function pure (no filesystem I/O)
 - Separate logging concerns from evaluation logic
 - Make it easy to extend to other agents beyond ReAct
+
+How it works:
+1. DSPy signature instructions (docstrings) define the agent prompts
+2. DSPy optimizers propose variations to the signature instructions
+3. For each variation, the metric function evaluates agent performance
+4. Optimizers keep the instructions that lead to best performance
+5. After optimization, extract the optimized instructions as final prompts
+
+This design makes it straightforward to extend to other inspect_ai agents.
 """
 
 import json
@@ -40,6 +49,7 @@ from agent_baselines.solvers.react.task_loader import (
 logger = logging.getLogger(__name__)
 
 # Generic task description for universal prompts (multi-task optimization)
+# Used to call forward() after optimization to extract the optimized prompts
 GENERIC_TASK_DESCRIPTION = """You will be given a task to complete. Use the available tools to help you solve the task, doing reasoning before each action to explain your approach."""
 
 # Target samples per task for MIPRO minibatch sizing
@@ -110,7 +120,7 @@ class ReactInspectAgent:
     2. Fixed parameters - what stays constant (models, agent config)
     3. Metric function - how to score a configuration
 
-    Design: The metric function is pure evaluation logic. Logging is handled
+    The metric function is pure evaluation logic. Logging is handled
     separately via optional wrapper to maintain separation of concerns.
     """
 
@@ -140,13 +150,17 @@ class ReactInspectAgent:
         The metric has no side effects (no logging, no I/O) - it's just
         evaluation logic. This makes it testable and reusable.
 
-        Design principle: The agent wrapper is responsible for knowing what
-        parameters its specific agent type needs and packaging them into the
-        agent_params dict. This makes it easy to add new agent types later.
+        The agent wrapper knows what parameters its specific agent type needs
+        and packages them into the agent_params dict, making it easy to add
+        new agent types later.
         """
 
         def metric(example, prediction, trace=None, pred_name=None, pred_trace=None):
             """Pure metric function for DSPy optimization.
+
+            DSPy optimizers modify the signature instructions and evaluate agent
+            performance with each variation. This metric evaluates a specific
+            configuration and returns its score.
 
             Args:
                 example: DSPy Example with sample_id, task_path, primary_metric
@@ -158,6 +172,7 @@ class ReactInspectAgent:
             Returns:
                 Score averaged across all evaluation models
             """
+            # Extract prompts from prediction
             system_message = prediction.system_message
             continue_message = prediction.continue_message
 
@@ -226,8 +241,7 @@ class ReactInspectAgent:
     def get_tunable_module(self) -> DSPyReActPrompts:
         """Get the DSPy module with tunable parameters.
 
-        For ReAct agent, this is the DSPyReActPrompts module with
-        system_message_generator and continue_message_generator.
+        Returns the DSPyReActPrompts module with optimizable signature instructions.
         """
         return DSPyReActPrompts()
 
@@ -581,6 +595,9 @@ def optimize_react_prompts(
         run_dir=run_config.run_dir,
     )
 
+    # Extract optimized prompts
+    # After optimization, the module's forward() method returns the optimized
+    # signature instructions, which become our final agent prompts
     optimized_prediction = optimized_module(
         task_description=GENERIC_TASK_DESCRIPTION,
         submit_function_name=DEFAULT_SUBMIT_NAME,
@@ -749,14 +766,14 @@ if __name__ == "__main__":
     opt_group.add_argument(
         "--max-bootstrapped-demos",
         type=int,
-        default=3,
-        help="Max bootstrapped demonstrations",
+        default=0,
+        help="Max bootstrapped demonstrations (default: 0 because forward() doesn't run actual agent evals - see dspy_agent.py forward() docstring for what would be needed to support this)",
     )
     opt_group.add_argument(
         "--max-labeled-demos",
         type=int,
-        default=3,
-        help="Max labeled demonstrations",
+        default=0,
+        help="Max labeled demonstrations (default: 0 because forward() doesn't run actual agent evals)",
     )
 
     # Evaluation configuration
