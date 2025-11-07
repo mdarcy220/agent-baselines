@@ -134,29 +134,24 @@ def load_samples_from_tasks(
 def create_mixed_dspy_examples(
     sample_tuples: list[tuple],
     train_ratio: float = 0.8,
-    task_description: str = "You will be given a task to complete. Use the available tools to help you solve the task, doing reasoning before each action to explain your approach.",
-    submit_function_name: str = "submit",
 ) -> tuple[list, list]:
     """Convert multi-task samples to DSPy examples and split into train/val.
 
     Each DSPy example contains:
-    - task_description: Generic task description (same for all samples)
-    - submit_function_name: Name of the submit function
-    - question: The actual question/problem from sample.input
+    - sample_id: The ID of the sample (INPUT - for running eval on just this sample)
+    - task_path: Path to the task (INPUT - e.g., "astabench/sqa_dev")
+    - primary_metric: Primary metric for this task (INPUT - e.g., "global_avg/mean")
+    - question: The actual question/problem from sample.input (INPUT - for DSPy's dataset analysis)
+    - task_name: Human-readable task name (for logging/debugging)
     - sample: Full Sample object (for metric evaluation)
-    - sample_id: The ID of the sample (for running eval on just this sample)
-    - task_path: Path to the task (e.g., "astabench/sqa_dev")
-    - primary_metric: Primary metric for this task (e.g., "global_avg/mean")
-    - task_name: Human-readable task name
 
-    The question field is available for DSPy optimizers to understand the dataset,
-    while evaluation uses sample_id to run the full agent on individual samples.
+    The fields marked as INPUT are passed to forward() during bootstrap, enabling
+    it to run actual agent evaluations and cache results. The question field helps
+    DSPy's dataset observation understand the task structure.
 
     Args:
         sample_tuples: List of (task_path, primary_metric, task_name, sample) tuples
         train_ratio: Ratio of data to use for training (default 0.8)
-        task_description: Generic task description for all samples
-        submit_function_name: Name of the submit function (default: "submit")
 
     Returns:
         Tuple of (train_examples, val_examples)
@@ -184,18 +179,17 @@ def create_mixed_dspy_examples(
     def create_examples(tuples):
         examples = []
         for task_path, primary_metric, task_name, sample in tuples:
-            # task_description is generic (same for all samples)
-            # question field contains the actual question for DSPy's dataset analysis
+            # Mark sample_id, task_path, primary_metric, and task as inputs
+            # These are passed to forward() during optimization to enable eval caching
+            # The 'task' field aligns with the signature's InputField name for MIPRO
             example = dspy.Example(
-                task_description=task_description,
-                submit_function_name=submit_function_name,
-                question=sample.input,
-                task_name=task_name,
                 sample_id=sample.id,
                 task_path=task_path,
                 primary_metric=primary_metric,
+                task=sample.input,
+                task_name=task_name,
                 sample=sample,
-            ).with_inputs("task_description", "submit_function_name")
+            ).with_inputs("sample_id", "task_path", "primary_metric", "task")
 
             examples.append(example)
         return examples

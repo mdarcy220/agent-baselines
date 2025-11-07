@@ -81,7 +81,7 @@ def _do_evaluation(
     solver_path: str,
     agent_params: dict,
     inspect_log_dir: str,
-) -> tuple[str, float, str, str]:
+) -> tuple[str, float, str, str, str]:
     """Perform the actual evaluation work.
 
     Args:
@@ -94,7 +94,8 @@ def _do_evaluation(
         inspect_log_dir: Directory for inspect_ai evaluation logs
 
     Returns:
-        Tuple of ("success", avg_score_value, sample_id, task_path)
+        Tuple of ("success", avg_score_value, sample_id, task_path, eval_path)
+        where eval_path is the path to the last .eval file created
 
     Raises:
         RuntimeError: If all models fail (systemic issue)
@@ -119,6 +120,7 @@ def _do_evaluation(
     agent_solver = solver_from_spec(solver_spec)
 
     scores = []
+    eval_path = None  # Track the last eval file path
     for model_name in model_names:
         print(f"Evaluating sample {sample_id} on model {model_name}", file=sys.stderr)
 
@@ -138,6 +140,11 @@ def _do_evaluation(
 
         assert logs and len(logs) > 0, f"No logs returned for sample {sample_id}"
         eval_log = logs[0]
+
+        # Store the eval file path (from the last model evaluation)
+        # All models use the same sample_id, so we keep the last one
+        if eval_log.location:
+            eval_path = eval_log.location
 
         # Handle evaluation failures gracefully
         #
@@ -199,7 +206,8 @@ def _do_evaluation(
     avg_score = sum(scores) / len(scores)
     print(f"Sample {sample_id} average score: {avg_score:.4f}", file=sys.stderr)
 
-    return ("success", avg_score, sample_id, task_path)
+    # Return eval_path along with score for caching support
+    return ("success", avg_score, sample_id, task_path, eval_path or "")
 
 
 def _run_eval_worker(args):
@@ -210,7 +218,7 @@ def _run_eval_worker(args):
               solver_path, agent_params, inspect_log_dir, std_log_file)
 
     Returns:
-        Tuple of ("success", avg_score_value, sample_id, task_path) or
+        Tuple of ("success", avg_score_value, sample_id, task_path, eval_path) or
         ("error", error_message)
     """
     (
@@ -259,7 +267,7 @@ def eval_in_subprocess(
     agent_params: dict,
     inspect_log_dir: str,
     timeout: int = 600,
-) -> float:
+) -> tuple[float, str]:
     """Run inspect_ai.eval() in an isolated subprocess with multi-model support.
 
     Uses inspect_ai's dynamic solver loading to support any solver type.
@@ -275,7 +283,9 @@ def eval_in_subprocess(
         timeout: Timeout in seconds (default: 600)
 
     Returns:
-        Average score across all models for this sample
+        Tuple of (average_score, eval_path) where:
+        - average_score: Average score across all models for this sample
+        - eval_path: Path to the .eval file created (empty string if not found)
 
     Raises:
         TimeoutError: If evaluation exceeds timeout
@@ -346,6 +356,7 @@ def eval_in_subprocess(
     if status == "error":
         raise RuntimeError(f"Evaluation failed for sample {sample_id}: {result[0]}")
 
-    # Unpack success result: (avg_score, sample_id, task_path)
+    # Unpack success result: (avg_score, sample_id, task_path, eval_path)
     score_value = result[0]
-    return score_value
+    eval_path = result[3] if len(result) > 3 else ""
+    return score_value, eval_path
