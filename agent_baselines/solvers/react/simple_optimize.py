@@ -78,6 +78,8 @@ class OptimizerConfig:
     max_bootstrapped_demos: int
     max_labeled_demos: int
     temperature: float
+    seed: int | None = None
+    minibatch_full_eval_steps: int = 5
 
 
 @dataclass
@@ -432,6 +434,10 @@ def run_optimization(
         "max_labeled_demos": optimizer_config.max_labeled_demos,
     }
 
+    # Add seed if provided (all optimizers support this)
+    if optimizer_config.seed is not None:
+        compile_kwargs["seed"] = optimizer_config.seed
+
     optimizer_type = optimizer_config.optimizer_type
 
     if optimizer_type == "gepa":
@@ -476,6 +482,9 @@ def run_optimization(
             )
 
         compile_kwargs["num_trials"] = num_trials
+        compile_kwargs["minibatch_full_eval_steps"] = (
+            optimizer_config.minibatch_full_eval_steps
+        )
 
         # Calculate adaptive minibatch size
         # Ensures adequate coverage across all tasks during optimization
@@ -659,8 +668,8 @@ if __name__ == "__main__":
     data_group.add_argument(
         "--train-ratio",
         type=float,
-        default=0.8,
-        help="Train/val split ratio (0.8 = 80/20)",
+        default=0.33,
+        help="Train/val split ratio (0.8 would be 80% train 20% val).  Note: MIPRO evalutes on the validation set and uses the train set for fewshot examples and dataset analysis.  This means it's generally desirable to have at least 1 train example per task, but additional ones have diminishing returns, while it's crucial to have sufficient validation examples for reliable evaluation.",
     )
 
     # Agent configuration
@@ -710,6 +719,30 @@ if __name__ == "__main__":
         type=float,
         default=1.0,
         help="Temperature for prompt generation",
+    )
+    opt_group.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for reproducibility",
+    )
+    opt_group.add_argument(
+        "--minibatch-full-eval-steps",
+        type=int,
+        default=5,
+        help="MIPRO: Steps between full validation evals (default: 5)",
+    )
+    opt_group.add_argument(
+        "--max-bootstrapped-demos",
+        type=int,
+        default=3,
+        help="Max bootstrapped demonstrations",
+    )
+    opt_group.add_argument(
+        "--max-labeled-demos",
+        type=int,
+        default=3,
+        help="Max labeled demonstrations",
     )
 
     # Evaluation configuration
@@ -776,9 +809,11 @@ if __name__ == "__main__":
         optimizer_model=args.optimizer_model,
         num_candidates=args.num_candidates,
         num_trials=args.num_trials,
-        max_bootstrapped_demos=3,
-        max_labeled_demos=3,
+        max_bootstrapped_demos=args.max_bootstrapped_demos,
+        max_labeled_demos=args.max_labeled_demos,
         temperature=args.optimizer_temperature,
+        seed=args.seed,
+        minibatch_full_eval_steps=args.minibatch_full_eval_steps,
     )
 
     run_config = RunConfig(
