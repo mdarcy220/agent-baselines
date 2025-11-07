@@ -352,13 +352,19 @@ def setup_optimization_run(
     log_file = f"{run_config.run_dir}/optimization.log"
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
+        format="%(asctime)s %(levelname)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
         handlers=[
             logging.StreamHandler(),
             logging.FileHandler(log_file),
         ],
     )
+
+    # Configure DSPy's logger to propagate to root logger
+    # DSPy sets propagate=False by default, which prevents logs from reaching our file handler
+    dspy_logger = logging.getLogger("dspy")
+    dspy_logger.handlers.clear()
+    dspy_logger.propagate = True
 
     logger.info(f"Run directory: {run_config.run_dir}")
     logger.info(f"Log file: {log_file}")
