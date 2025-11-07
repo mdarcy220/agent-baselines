@@ -80,6 +80,7 @@ def _do_evaluation(
     primary_metric: str,
     solver_path: str,
     agent_params: dict,
+    inspect_log_dir: str,
 ) -> tuple[str, float, str, str]:
     """Perform the actual evaluation work.
 
@@ -90,6 +91,7 @@ def _do_evaluation(
         primary_metric: Primary metric to extract (format: "scorer_name/metric_name")
         solver_path: Path to solver (e.g., "agent_baselines/solvers/react/dspy_agent.py@create_agent_with_dspy_prompts")
         agent_params: Parameters to pass to the solver factory as kwargs
+        inspect_log_dir: Directory for inspect_ai evaluation logs
 
     Returns:
         Tuple of ("success", avg_score_value, sample_id, task_path)
@@ -128,7 +130,7 @@ def _do_evaluation(
             model=model_name,
             solver=agent_solver,
             sample_id=sample_id,
-            log_dir=".dspy_cache",
+            log_dir=inspect_log_dir,
             log_level="warning",
             display="plain",
             retry_on_error=2,
@@ -205,7 +207,7 @@ def _run_eval_worker(args):
 
     Args:
         args: Tuple of (sample_id, model_names, task_path, primary_metric,
-              solver_path, agent_params, std_log_file)
+              solver_path, agent_params, inspect_log_dir, std_log_file)
 
     Returns:
         Tuple of ("success", avg_score_value, sample_id, task_path) or
@@ -218,6 +220,7 @@ def _run_eval_worker(args):
         primary_metric,
         solver_path,
         agent_params,
+        inspect_log_dir,
         std_log_file,
     ) = args
 
@@ -230,6 +233,7 @@ def _run_eval_worker(args):
                 primary_metric=primary_metric,
                 solver_path=solver_path,
                 agent_params=agent_params,
+                inspect_log_dir=inspect_log_dir,
             )
         except Exception as e:
             # Return exception info
@@ -254,7 +258,7 @@ def eval_in_subprocess(
     solver_path: str,
     agent_params: dict,
     timeout: int = 600,
-    std_log_file: str | None = None,
+    inspect_log_dir: str = ".dspy_cache",
 ) -> float:
     """Run inspect_ai.eval() in an isolated subprocess with multi-model support.
 
@@ -268,7 +272,7 @@ def eval_in_subprocess(
         solver_path: Path to solver (e.g., "agent_baselines/solvers/react/dspy_agent.py@create_agent_with_dspy_prompts")
         agent_params: Parameters to pass to the solver factory as kwargs
         timeout: Timeout in seconds (default: 600)
-        std_log_file: Optional path to redirect subprocess output (default: None)
+        inspect_log_dir: Directory for logs (default: ".dspy_cache")
 
     Returns:
         Average score across all models for this sample
@@ -279,6 +283,14 @@ def eval_in_subprocess(
     """
     # Use Pool.apply() to run worker in subprocess
     # This properly handles return values without needing Queue
+
+    # Derive stdout/stderr log file from inspect_log_dir
+    # Only redirect output if we have a proper run directory (not default ".dspy_cache")
+    std_log_file = None
+    if inspect_log_dir != ".dspy_cache":
+        os.makedirs(inspect_log_dir, exist_ok=True)
+        timestamp = int(time.time() * 1000)
+        std_log_file = f"{inspect_log_dir}/{sample_id}_{timestamp}_stdout.log"
 
     # Create a single-process pool for this evaluation.
     #
@@ -306,6 +318,7 @@ def eval_in_subprocess(
                         primary_metric,
                         solver_path,
                         agent_params,
+                        inspect_log_dir,
                         std_log_file,
                     ),
                 ),

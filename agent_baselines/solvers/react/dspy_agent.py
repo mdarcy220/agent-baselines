@@ -114,6 +114,7 @@ class DSPyReActPrompts(dspy.Module):
         )
 
 
+@solver
 def create_agent_with_dspy_prompts(
     system_message_text: str,
     continue_message_text: str,

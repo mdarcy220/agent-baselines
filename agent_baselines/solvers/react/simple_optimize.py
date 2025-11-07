@@ -175,11 +175,8 @@ class ReactInspectAgent:
                 **self.config.agent_kwargs,
             }
 
-            std_log_file = None
-            if self.config.log_dir:
-                os.makedirs(self.config.log_dir, exist_ok=True)
-                timestamp = int(time.time() * 1000)
-                std_log_file = f"{self.config.log_dir}/{sample_id}_{timestamp}.log"
+            # Use eval_logs directory for both inspect logs and subprocess stdout/stderr
+            inspect_log_dir = self.config.log_dir or ".dspy_cache"
 
             # Run evaluation in subprocess (enables parallelization)
             # This handles multi-model evaluation and returns averaged score
@@ -191,7 +188,7 @@ class ReactInspectAgent:
                 solver_path=self.solver_path,
                 agent_params=agent_params,
                 timeout=self.config.eval_timeout,
-                std_log_file=std_log_file,
+                inspect_log_dir=inspect_log_dir,
             )
 
             return score_value
