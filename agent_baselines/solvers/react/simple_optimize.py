@@ -536,7 +536,7 @@ if __name__ == "__main__":
         "--train-ratio",
         type=float,
         default=0.33,
-        help="Train/val split ratio (0.8 would be 80% train 20% val).  Note: MIPRO evalutes on the validation set and uses the train set for fewshot examples and dataset analysis.  This means it's generally desirable to have at least 1 train example per task, but additional ones have diminishing returns, while it's crucial to have sufficient validation examples for reliable evaluation.",
+        help="Train/val split ratio (0.8 would be 80%% train 20%% val).  Note: MIPRO evalutes on the validation set and uses the train set for fewshot examples and dataset analysis.  This means it's generally desirable to have at least 1 train example per task, but additional ones have diminishing returns, while it's crucial to have sufficient validation examples for reliable evaluation.",
     )
 
     # Agent configuration
