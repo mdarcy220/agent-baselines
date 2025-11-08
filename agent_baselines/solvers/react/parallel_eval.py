@@ -15,8 +15,30 @@ import os
 import sys
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class EvalSuccess:
+    """Successful evaluation result."""
+
+    score: float
+    sample_id: str
+    task_path: str
+    summary_path: str
+
+
+@dataclass
+class EvalError:
+    """Failed evaluation result."""
+
+    error_message: str
+
+
+# Union type for evaluation results
+EvalResult = EvalSuccess | EvalError
 
 
 @contextmanager
@@ -81,121 +103,120 @@ def _do_evaluation(
     solver_path: str,
     agent_params: dict,
     inspect_log_dir: str,
-) -> tuple[str, float, str, str, str]:
-    """Perform the actual evaluation work.
+) -> EvalSuccess:
+    """Perform the actual evaluation work using parallel multi-model evaluation.
 
     Args:
         sample_id: ID of the sample to evaluate
-        model_names: List of models to evaluate on
+        model_names: List of models to evaluate on (runs in parallel)
         task_path: Task path (e.g., "astabench/sqa_dev")
         primary_metric: Primary metric to extract (format: "scorer_name/metric_name")
-        solver_path: Path to solver (e.g., "agent_baselines/solvers/react/dspy_agent.py@create_agent_with_dspy_prompts")
+        solver_path: Path to solver
         agent_params: Parameters to pass to the solver factory as kwargs
         inspect_log_dir: Directory for inspect_ai evaluation logs
 
     Returns:
-        Tuple of ("success", avg_score_value, sample_id, task_path, eval_path)
-        where eval_path is the path to the last .eval file created
+        EvalSuccess with score, sample_id, task_path, and summary_path
 
     Raises:
         RuntimeError: If all models fail (systemic issue)
     """
+    import json
+    from datetime import datetime
+    from pathlib import Path
+
     print(
-        f"Starting eval worker for sample {sample_id} on task {task_path}",
+        f"Starting parallel eval for sample {sample_id} on {len(model_names)} models",
         file=sys.stderr,
     )
+
     # Import inside worker to ensure fresh state
     from inspect_ai import eval as inspect_eval
     from inspect_ai._eval.loader import SolverSpec, solver_from_spec
 
     # Parse primary_metric format: "scorer_name/metric_name"
-    # E.g., "global_avg/mean" or "score_discoverybench/mean"
     metric_parts = primary_metric.split("/")
     assert len(metric_parts) == 2, f"Invalid primary_metric format: {primary_metric}"
     scorer_name, metric_name = metric_parts
 
-    # Load solver dynamically using inspect_ai's solver loading mechanism
-    # This allows any solver to be used, not just ReAct
+    # Load solver dynamically
     solver_spec = SolverSpec(solver=solver_path, args=agent_params)
     agent_solver = solver_from_spec(solver_spec)
 
+    # Evaluate all models in parallel using inspect_ai's multi-model support
+    print(f"Running parallel evaluation on models: {model_names}", file=sys.stderr)
+    logs = inspect_eval(
+        tasks=task_path,
+        model=model_names,  # Pass list - runs in parallel!
+        solver=agent_solver,
+        sample_id=sample_id,
+        log_dir=inspect_log_dir,
+        log_level="warning",
+        display="plain",
+        retry_on_error=2,
+    )
+
+    assert logs and len(logs) > 0, f"No logs returned for sample {sample_id}"
+    assert len(logs) == len(
+        model_names
+    ), f"Expected {len(model_names)} logs, got {len(logs)}"
+
+    # Process results from all models
+    model_results = {}
     scores = []
-    eval_path = None  # Track the last eval file path
-    for model_name in model_names:
-        print(f"Evaluating sample {sample_id} on model {model_name}", file=sys.stderr)
 
-        # Retry configuration: We allow up to 2 retries to handle transient failures
-        # (e.g., scorer crashes due to unexpected agent output, temporary API issues).
-        # This reduces spurious failures without hiding systemic problems.
-        logs = inspect_eval(
-            tasks=task_path,
-            model=model_name,
-            solver=agent_solver,
-            sample_id=sample_id,
-            log_dir=inspect_log_dir,
-            log_level="warning",
-            display="plain",
-            retry_on_error=2,
-        )
+    for eval_log in logs:
+        model_name = eval_log.eval.model
 
-        assert logs and len(logs) > 0, f"No logs returned for sample {sample_id}"
-        eval_log = logs[0]
+        # Extract score and answer for this model
+        score_value = 0.0
+        answer = None
+        eval_path = eval_log.location or ""
 
-        # Store the eval file path (from the last model evaluation)
-        # All models use the same sample_id, so we keep the last one
-        if eval_log.location:
-            eval_path = eval_log.location
-
-        # Handle evaluation failures gracefully
-        #
-        # Design decision: We return 0.0 instead of crashing the entire optimization.
-        # Rationale:
-        # 1. A bad prompt can cause systemic failures across samples (e.g., malformed
-        #    output that breaks the scorer). Crashing loses all optimization progress.
-        # 2. Scoring 0.0 signals DSPy to avoid this prompt in future iterations.
-        # 3. Infrastructure bugs would cause ALL samples to score 0.0, making it
-        #    obvious in the optimization results (not a silent failure).
-        # 4. Prompt-specific failures mean it's a bad prompt we want to avoid anyway.
+        # Handle evaluation failures gracefully (same rationale as before)
         if not eval_log.results or not eval_log.results.scores:
-            error_msg = (
-                eval_log.error if eval_log.error else "No results/scores returned"
-            )
+            error_msg = eval_log.error if eval_log.error else "No results/scores"
             logger.error(
-                f"Eval failed for {sample_id} on {model_name}: {error_msg}. Returning score 0.0"
+                f"Eval failed for {sample_id} on {model_name}: {error_msg}. Using score 0.0"
             )
-            scores.append(0.0)
-            continue
+        else:
+            # Find the scorer
+            scorer = None
+            for score in eval_log.results.scores:
+                if score.name == scorer_name:
+                    scorer = score
+                    break
 
-        # Find the scorer with matching name
-        scorer = None
-        for score in eval_log.results.scores:
-            if score.name == scorer_name:
-                scorer = score
-                break
+            if not scorer:
+                available = [s.name for s in eval_log.results.scores]
+                logger.error(
+                    f"Scorer '{scorer_name}' not found for {sample_id} on {model_name}. "
+                    f"Available: {available}. Using score 0.0"
+                )
+            elif metric_name not in scorer.metrics:
+                available = list(scorer.metrics.keys())
+                logger.error(
+                    f"Metric '{metric_name}' not found in scorer '{scorer_name}' for {sample_id} on {model_name}. "
+                    f"Available: {available}. Using score 0.0"
+                )
+            else:
+                score_value = float(scorer.metrics[metric_name].value)
 
-        if not scorer:
-            available = [s.name for s in eval_log.results.scores]
-            logger.error(
-                f"Scorer '{scorer_name}' not found for {sample_id} on {model_name}. "
-                f"Available: {available}. Returning score 0.0"
-            )
-            scores.append(0.0)
-            continue
+            # Extract answer from eval output
+            if eval_log.samples and len(eval_log.samples) > 0:
+                sample = eval_log.samples[0]
+                if sample.output and sample.output.completion:
+                    answer = sample.output.completion
 
-        if metric_name not in scorer.metrics:
-            available = list(scorer.metrics.keys())
-            logger.error(
-                f"Metric '{metric_name}' not found in scorer '{scorer_name}' for {sample_id} on {model_name}. "
-                f"Available: {available}. Returning score 0.0"
-            )
-            scores.append(0.0)
-            continue
-
-        score_value = float(scorer.metrics[metric_name].value)
+        model_results[model_name] = {
+            "eval_path": eval_path,
+            "score": score_value,
+            "answer": answer,
+        }
         scores.append(score_value)
         print(f"Model {model_name} score: {score_value:.4f}", file=sys.stderr)
 
-    if not scores:
+    if not scores or all(s == 0.0 for s in scores):
         error_msg = (
             f"All {len(model_names)} models failed for sample {sample_id} on task {task_path}. "
             f"This likely indicates a systemic issue with the prompts or sample."
@@ -206,11 +227,35 @@ def _do_evaluation(
     avg_score = sum(scores) / len(scores)
     print(f"Sample {sample_id} average score: {avg_score:.4f}", file=sys.stderr)
 
-    # Return eval_path along with score for caching support
-    return ("success", avg_score, sample_id, task_path, eval_path or "")
+    # Create summary JSON file
+    # Store model results in deterministic order (by model name) for reproducibility
+    summary_data = {
+        "sample_id": sample_id,
+        "task_path": task_path,
+        "primary_metric": primary_metric,
+        "timestamp": datetime.now().isoformat(),
+        "model_names": model_names,  # Preserve original order
+        "models": model_results,
+        "average_score": avg_score,
+    }
+
+    # Write summary to eval log directory
+    summary_filename = f"{sample_id.replace('|', '_').replace('/', '_')}_summary.json"
+    summary_path = Path(inspect_log_dir) / summary_filename
+    with open(summary_path, "w") as f:
+        json.dump(summary_data, f, indent=2)
+
+    print(f"Wrote summary to: {summary_path}", file=sys.stderr)
+
+    return EvalSuccess(
+        score=avg_score,
+        sample_id=sample_id,
+        task_path=task_path,
+        summary_path=str(summary_path),
+    )
 
 
-def _run_eval_worker(args):
+def _run_eval_worker(args) -> EvalResult:
     """Worker function that runs in a subprocess via Pool.map.
 
     Args:
@@ -218,8 +263,7 @@ def _run_eval_worker(args):
               solver_path, agent_params, inspect_log_dir, std_log_file)
 
     Returns:
-        Tuple of ("success", avg_score_value, sample_id, task_path, eval_path) or
-        ("error", error_message)
+        EvalSuccess on success or EvalError on failure
     """
     (
         sample_id,
@@ -255,7 +299,7 @@ def _run_eval_worker(args):
             logger.error(
                 f"Exception in eval worker for {sample_id} on {task_path}: {type(e).__name__}: {e}"
             )
-            return ("error", error_msg)
+            return EvalError(error_message=error_msg)
 
 
 def eval_in_subprocess(
@@ -351,12 +395,17 @@ def eval_in_subprocess(
                 f"Subprocess failed for sample {sample_id} after {time.perf_counter() - subprocess_start:.1f}s: {e}"
             )
 
-    status, *result = result_data
+    # Handle result based on type
+    if isinstance(result_data, EvalError):
+        raise RuntimeError(
+            f"Evaluation failed for sample {sample_id}: {result_data.error_message}"
+        )
 
-    if status == "error":
-        raise RuntimeError(f"Evaluation failed for sample {sample_id}: {result[0]}")
+    if isinstance(result_data, EvalSuccess):
+        return result_data.score, result_data.summary_path
 
-    # Unpack success result: (avg_score, sample_id, task_path, eval_path)
-    score_value = result[0]
-    eval_path = result[3] if len(result) > 3 else ""
-    return score_value, eval_path
+    # Fail loudly if we get an unexpected type
+    raise TypeError(
+        f"Unexpected result type from worker: {type(result_data)}. "
+        f"Expected EvalSuccess or EvalError."
+    )

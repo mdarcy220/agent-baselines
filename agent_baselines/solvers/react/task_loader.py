@@ -57,9 +57,8 @@ def load_tasks_from_config(
 
     # Get all tasks from all splits (we need to search across splits for specific paths)
     all_tasks = []
-    for split_data in config_data.get("splits", []):
-        split_name = split_data.get("name")
-        tasks_in_split = suite_config.get_tasks(split_name)
+    for split in suite_config.splits:
+        tasks_in_split = suite_config.get_tasks(split.name)
         all_tasks.extend(tasks_in_split)
 
     # If specific task paths requested, filter to those

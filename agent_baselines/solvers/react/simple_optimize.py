@@ -435,7 +435,7 @@ def optimize_react_prompts(
     setup_optimization_run(optimizer_config, agent_config, run_config)
     train_examples, val_examples, task_configs = load_and_prepare_data(task_config)
 
-    agent = ReactInspectAgent(agent_config)
+    agent = ReactInspectAgent(agent_config, seed=optimizer_config.seed)
     logger.info(f"Agent config: {json.dumps(asdict(agent_config))}")
 
     optimized_agent, optimizer_name = run_optimization(
