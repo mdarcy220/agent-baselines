@@ -17,6 +17,7 @@ Optimization Flow:
 """
 
 import logging
+import random
 from dataclasses import dataclass
 
 import dspy
@@ -27,6 +28,10 @@ from agent_baselines.solvers.react.basic_agent import (
     DEFAULT_SUBMIT_NAME,
     DEFAULT_SYSTEM_MESSAGE,
     basic_agent,
+)
+from agent_baselines.solvers.react.parallel_eval import (
+    eval_in_subprocess,
+    load_summary_file,
 )
 
 logger = logging.getLogger(__name__)
@@ -68,9 +73,6 @@ def extract_answer_from_summary(
     This approach is thread-safe because each call creates its own RNG instance
     seeded from deterministic data.
 
-    Note: This is only used during optimization. For inference, we use the
-    inspect_ai agent directly with a specific model.
-
     Args:
         summary_path: Path to the summary JSON file
         seed: Optional seed to combine with sample_id for deterministic variety
@@ -78,40 +80,29 @@ def extract_answer_from_summary(
     Returns:
         The answer string from a randomly selected model, or None if not found
     """
-    import json
-    import random
 
     try:
-        with open(summary_path, "r") as f:
-            summary = json.load(f)
+        summary = load_summary_file(summary_path)
 
-        # Extract required fields - fail loudly if schema is wrong
-        # (summary files are created by our code, so missing fields = bug)
-        model_names = summary["model_names"]
-        models = summary["models"]
-        sample_id = summary["sample_id"]
-
-        if not model_names or not models:
+        if not summary.model_names or not summary.models:
             logger.warning(f"No models/answers found in summary file: {summary_path}")
             return None
 
-        # Select model using isolated RNG instance (thread-safe)
         if seed is not None:
-            # Deterministic: combine user seed with sample_id for reproducible variety
-            local_seed = hash((seed, sample_id)) % (2**32)
+            # Deterministic: combine user seed with sample_id for reproducible
+            # variety (con: will repeat if we eval this sample many times with
+            # the same seed)
+            local_seed = hash((seed, summary.sample_id)) % (2**32)
             rng = random.Random(local_seed)
         else:
-            # Non-deterministic: use unseeded RNG (user accepts randomness)
             rng = random.Random()
 
-        selected_model = rng.choice(model_names)
-        # models[selected_model] should always exist (we selected from model_names)
-        # but answer might be None if extraction failed
-        answer = models[selected_model]["answer"]
+        selected_model = rng.choice(summary.model_names)
+        answer = summary.models[selected_model].answer
 
         logger.debug(
             f"Selected answer from model: {selected_model} "
-            f"(out of {len(model_names)} models, seed={seed})"
+            f"(out of {len(summary.model_names)} models, seed={seed})"
         )
         return answer
 
@@ -133,21 +124,16 @@ def extract_score_from_summary(summary_path: str) -> float:
         The average score value
 
     Raises:
-        ValueError: If the score is not found in the summary file
+        KeyError: If required fields are missing from summary file
+        FileNotFoundError: If summary file doesn't exist
     """
-    import json
 
     try:
-        with open(summary_path, "r") as f:
-            summary = json.load(f)
+        summary = load_summary_file(summary_path)
+        return summary.average_score
 
-        if "average_score" not in summary:
-            raise ValueError(f"No average_score found in summary file: {summary_path}")
-
-        return float(summary["average_score"])
-
-    except Exception as e:
-        logger.error(f"Error extracting score from {summary_path}: {e}")
+    except Exception:
+        logger.exception(f"Error extracting score from {summary_path}:")
         raise
 
 
@@ -230,19 +216,13 @@ class ReactInspectAgent(dspy.Module):
         primary_metric: str | None = None,
         task: str | None = None,
     ):
-        """Extract signature instructions and run agent evaluation.
+        """Run agent evaluation during optimization.
 
-        This method:
-        1. Extracts signature instructions (modified by DSPy optimizers)
-        2. Runs eval_in_subprocess() to evaluate the agent with current prompts
-        3. Caches the eval result in prediction.eval_path for metric() to use
-
-        The signature instructions contain {submit} placeholders which are NOT
-        replaced here. They will be replaced by inspect_ai's system_message() via
-        str.format() when the prompts are used in create_agent_with_dspy_prompts().
+        Called by DSPy optimizers to evaluate candidate prompts. Runs eval_in_subprocess()
+        and caches results for metric() to extract scores.
 
         Args:
-            sample_id: Sample ID to evaluate (if provided, runs actual eval)
+            sample_id: Sample ID to evaluate
             task_path: Task path (e.g., "astabench/sqa_dev")
             primary_metric: Primary metric for this task (e.g., "global_avg/mean")
             task: The task/question content (aligns with signature field for MIPRO)
@@ -254,43 +234,32 @@ class ReactInspectAgent(dspy.Module):
             - 'summary_path': Path to summary JSON file (if eval was run)
             - 'answer': Extracted answer from summary (if eval was run)
         """
-        # Extract current instructions from signatures
-        # After optimization, these will contain the optimized instructions
         system_instructions = self.system_prompt.signature.instructions
         continue_instructions = self.continue_prompt.signature.instructions
 
-        # Create base prediction
-        # Note: {submit} placeholder is left intact for system_message() to replace
+        # {submit} placeholder is left intact for system_message() to replace later
         prediction_fields = {
             "system_message": system_instructions,
             "continue_message": continue_instructions,
         }
 
-        # If sample data is provided, run actual agent evaluation
         if (
             sample_id is not None
             and task_path is not None
             and primary_metric is not None
         ):
             try:
-                # Import here to avoid circular dependency
-                from agent_baselines.solvers.react.parallel_eval import (
-                    eval_in_subprocess,
-                )
 
-                # Build agent_params dict with current prompts
                 agent_params = {
                     "system_message_text": system_instructions,
                     "continue_message_text": continue_instructions,
                     **self.config.agent_kwargs,
                 }
 
-                # Run evaluation in subprocess
                 logger.info(
                     f"Running eval for sample {sample_id} (caching for optimization)"
                 )
 
-                # Run the evaluation - returns both score and summary_path
                 score, summary_path = eval_in_subprocess(
                     sample_id=sample_id,
                     model_names=self.config.eval_models,
@@ -303,11 +272,9 @@ class ReactInspectAgent(dspy.Module):
                 )
 
                 if summary_path:
-                    # Extract answer from the summary file
                     # Use seed for deterministic but varied answer selection
                     answer = extract_answer_from_summary(summary_path, seed=self.seed)
 
-                    # Add to prediction for caching
                     prediction_fields["summary_path"] = summary_path
                     prediction_fields["answer"] = answer or ""
 
@@ -318,11 +285,11 @@ class ReactInspectAgent(dspy.Module):
                 else:
                     logger.warning(f"No summary path returned for sample {sample_id}")
 
-            except Exception as e:
-                logger.error(
-                    f"Error running eval for sample {sample_id} in forward(): {e}"
+            except Exception:
+                logger.exception(
+                    f"Error running eval for sample {sample_id} in forward():"
                 )
-                # Continue without caching - metric will raise error
+                # Continue without caching - metric() will fail with clear error
 
         return dspy.Prediction(**prediction_fields)
 
@@ -347,7 +314,6 @@ class ReactInspectAgent(dspy.Module):
         """
         sample_id = example.sample_id
 
-        # Extract score from cached summary file
         # forward() always caches eval results, so summary_path should always be present
         if not hasattr(prediction, "summary_path") or not prediction.summary_path:
             raise ValueError(
@@ -378,14 +344,10 @@ class ReactInspectAgent(dspy.Module):
         task_name = example.task_name
 
         try:
-            # Call base metric for evaluation
             score_value = self.metric(example, prediction, trace)
-
-            # Log result concisely
             logger.info(f"✓ {sample_id} ({task_name}): {score_value:.4f}")
             return score_value
 
         except Exception as e:
-            # Log failure
             logger.info(f"✗ {sample_id} ({task_name}): {e}")
             raise

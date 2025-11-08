@@ -208,7 +208,6 @@ def setup_optimization_run(
     os.makedirs(run_config.run_dir, exist_ok=True)
     os.makedirs(agent_config.log_dir, exist_ok=True)
 
-    # Configure logging to console and file
     log_file = f"{run_config.run_dir}/optimization.log"
     logging.basicConfig(
         level=logging.INFO,
@@ -220,8 +219,7 @@ def setup_optimization_run(
         ],
     )
 
-    # Configure DSPy's logger to propagate to root logger
-    # DSPy sets propagate=False by default, which prevents logs from reaching our file handler
+    # DSPy sets propagate=False by default, preventing logs from reaching our file handler
     dspy_logger = logging.getLogger("dspy")
     dspy_logger.handlers.clear()
     dspy_logger.propagate = True
@@ -316,7 +314,6 @@ def run_optimization(
         "max_labeled_demos": optimizer_config.max_labeled_demos,
     }
 
-    # Add seed if provided (all optimizers support this)
     if optimizer_config.seed is not None:
         compile_kwargs["seed"] = optimizer_config.seed
 
@@ -447,18 +444,12 @@ def optimize_react_prompts(
         run_dir=run_config.run_dir,
     )
 
-    # Extract optimized prompts
-    # After optimization, the agent's forward() method returns the optimized
-    # signature instructions, which become our final agent prompts
-    # Note: We don't pass sample data here, so forward() just returns the prompts
-    # without running any evals (sample_id, task_path, primary_metric are optional)
-    optimized_prediction = optimized_agent()
-
+    # After optimization, extract prompts directly from signatures
     optimizer_model = optimizer_config.optimizer_model or agent_config.eval_models[0]
 
     optimized_prompts = {
-        "system_message": optimized_prediction.system_message,
-        "continue_message": optimized_prediction.continue_message,
+        "system_message": optimized_agent.system_prompt.signature.instructions,
+        "continue_message": optimized_agent.continue_prompt.signature.instructions,
         "metadata": {
             "eval_models": agent_config.eval_models,
             "optimizer_model": optimizer_model,
@@ -497,11 +488,6 @@ def optimize_react_prompts(
             indent=2,
         )
     logger.info(f"Saved sample IDs to: {sample_ids_file}")
-
-    if val_examples:
-        val_score = agent.logging_metric(val_examples[0], optimized_prediction)
-        logger.info(f"Validation score: {val_score:.4f}")
-
     logger.info(f"Run directory: {run_config.run_dir}")
 
     return optimized_prompts

@@ -9,15 +9,45 @@ solver from a path. The agent_params dict is passed as kwargs to the solver
 factory function, enabling support for different agent types.
 """
 
+import json
 import logging
 import multiprocessing as mp
 import os
 import sys
 import time
+import traceback
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ModelResult:
+    """Result from evaluating a single model."""
+
+    eval_path: str
+    score: float
+    answer: str | None
+
+
+@dataclass
+class SummaryFile:
+    """Multi-model evaluation summary.
+
+    This is the schema for summary JSON files created during optimization.
+    Each summary contains results from evaluating multiple models on a single sample.
+    """
+
+    sample_id: str
+    task_path: str
+    primary_metric: str
+    timestamp: str
+    model_names: list[str]  # Preserve original order
+    models: dict[str, ModelResult]  # model_name -> result
+    average_score: float
 
 
 @dataclass
@@ -41,6 +71,43 @@ class EvalError:
 EvalResult = EvalSuccess | EvalError
 
 
+def load_summary_file(summary_path: str) -> SummaryFile:
+    """Load and parse a summary JSON file.
+
+    Args:
+        summary_path: Path to the summary JSON file
+
+    Returns:
+        Parsed SummaryFile object
+
+    Raises:
+        FileNotFoundError: If summary file doesn't exist
+        KeyError: If required fields are missing from summary
+        ValueError: If summary format is invalid
+    """
+
+    with open(summary_path, "r") as f:
+        data = json.load(f)
+
+    models = {}
+    for model_name, model_data in data["models"].items():
+        models[model_name] = ModelResult(
+            eval_path=model_data["eval_path"],
+            score=model_data["score"],
+            answer=model_data["answer"],
+        )
+
+    return SummaryFile(
+        sample_id=data["sample_id"],
+        task_path=data["task_path"],
+        primary_metric=data["primary_metric"],
+        timestamp=data["timestamp"],
+        model_names=data["model_names"],
+        models=models,
+        average_score=data["average_score"],
+    )
+
+
 @contextmanager
 def redirect_output(std_log_file: str | None):
     """Context manager to redirect stdout/stderr to a log file at the FD level.
@@ -53,44 +120,37 @@ def redirect_output(std_log_file: str | None):
         std_log_file: Path to log file, or None to keep default output
     """
     if std_log_file is None:
-        # No redirection needed
         yield
         return
 
-    # Create log directory if needed
     log_dir = os.path.dirname(std_log_file)
     if log_dir:
         os.makedirs(log_dir, exist_ok=True)
 
-    # Save original file descriptors by duplicating them
+    # Must save FDs before redirection to restore them later
     old_stdout_fd = os.dup(sys.stdout.fileno())
     old_stderr_fd = os.dup(sys.stderr.fileno())
 
-    # Open log file for writing
     log_file = None
     try:
         log_file = open(std_log_file, "w")
 
-        # Redirect at file descriptor level (affects all subprocesses)
+        # Use FD-level redirection so subprocesses (like Docker) also get redirected
         os.dup2(log_file.fileno(), sys.stdout.fileno())
         os.dup2(log_file.fileno(), sys.stderr.fileno())
 
         yield
 
     finally:
-        # Flush any remaining output
         sys.stdout.flush()
         sys.stderr.flush()
 
-        # Restore original file descriptors
         os.dup2(old_stdout_fd, sys.stdout.fileno())
         os.dup2(old_stderr_fd, sys.stderr.fileno())
 
-        # Close saved file descriptors
         os.close(old_stdout_fd)
         os.close(old_stderr_fd)
 
-        # Close log file
         if log_file is not None:
             log_file.close()
 
@@ -121,33 +181,28 @@ def _do_evaluation(
     Raises:
         RuntimeError: If all models fail (systemic issue)
     """
-    import json
-    from datetime import datetime
-    from pathlib import Path
 
     print(
         f"Starting parallel eval for sample {sample_id} on {len(model_names)} models",
         file=sys.stderr,
     )
 
-    # Import inside worker to ensure fresh state
+    # Import inside worker to ensure fresh state (avoid leaking across subprocesses)
     from inspect_ai import eval as inspect_eval
     from inspect_ai._eval.loader import SolverSpec, solver_from_spec
 
-    # Parse primary_metric format: "scorer_name/metric_name"
     metric_parts = primary_metric.split("/")
     assert len(metric_parts) == 2, f"Invalid primary_metric format: {primary_metric}"
     scorer_name, metric_name = metric_parts
 
-    # Load solver dynamically
     solver_spec = SolverSpec(solver=solver_path, args=agent_params)
     agent_solver = solver_from_spec(solver_spec)
 
-    # Evaluate all models in parallel using inspect_ai's multi-model support
+    # inspect_ai runs multiple models in parallel when passed a list
     print(f"Running parallel evaluation on models: {model_names}", file=sys.stderr)
     logs = inspect_eval(
         tasks=task_path,
-        model=model_names,  # Pass list - runs in parallel!
+        model=model_names,
         solver=agent_solver,
         sample_id=sample_id,
         log_dir=inspect_log_dir,
@@ -161,26 +216,23 @@ def _do_evaluation(
         model_names
     ), f"Expected {len(model_names)} logs, got {len(logs)}"
 
-    # Process results from all models
     model_results = {}
     scores = []
 
     for eval_log in logs:
         model_name = eval_log.eval.model
 
-        # Extract score and answer for this model
         score_value = 0.0
         answer = None
         eval_path = eval_log.location or ""
 
-        # Handle evaluation failures gracefully (same rationale as before)
+        # Use 0.0 for failures to avoid blocking optimization on bad samples
         if not eval_log.results or not eval_log.results.scores:
             error_msg = eval_log.error if eval_log.error else "No results/scores"
             logger.error(
                 f"Eval failed for {sample_id} on {model_name}: {error_msg}. Using score 0.0"
             )
         else:
-            # Find the scorer
             scorer = None
             for score in eval_log.results.scores:
                 if score.name == scorer_name:
@@ -202,17 +254,16 @@ def _do_evaluation(
             else:
                 score_value = float(scorer.metrics[metric_name].value)
 
-            # Extract answer from eval output
             if eval_log.samples and len(eval_log.samples) > 0:
                 sample = eval_log.samples[0]
                 if sample.output and sample.output.completion:
                     answer = sample.output.completion
 
-        model_results[model_name] = {
-            "eval_path": eval_path,
-            "score": score_value,
-            "answer": answer,
-        }
+        model_results[model_name] = ModelResult(
+            eval_path=eval_path,
+            score=score_value,
+            answer=answer,
+        )
         scores.append(score_value)
         print(f"Model {model_name} score: {score_value:.4f}", file=sys.stderr)
 
@@ -227,23 +278,21 @@ def _do_evaluation(
     avg_score = sum(scores) / len(scores)
     print(f"Sample {sample_id} average score: {avg_score:.4f}", file=sys.stderr)
 
-    # Create summary JSON file
-    # Store model results in deterministic order (by model name) for reproducibility
-    summary_data = {
-        "sample_id": sample_id,
-        "task_path": task_path,
-        "primary_metric": primary_metric,
-        "timestamp": datetime.now().isoformat(),
-        "model_names": model_names,  # Preserve original order
-        "models": model_results,
-        "average_score": avg_score,
-    }
+    summary = SummaryFile(
+        sample_id=sample_id,
+        task_path=task_path,
+        primary_metric=primary_metric,
+        timestamp=datetime.now().isoformat(),
+        model_names=model_names,
+        models=model_results,
+        average_score=avg_score,
+    )
 
-    # Write summary to eval log directory
     summary_filename = f"{sample_id.replace('|', '_').replace('/', '_')}_summary.json"
     summary_path = Path(inspect_log_dir) / summary_filename
     with open(summary_path, "w") as f:
-        json.dump(summary_data, f, indent=2)
+        # asdict() recursively converts nested dataclasses (ModelResult)
+        json.dump(asdict(summary), f, indent=2)
 
     print(f"Wrote summary to: {summary_path}", file=sys.stderr)
 
@@ -293,8 +342,6 @@ def _run_eval_worker(args) -> EvalResult:
             # Note: This captures exceptions that occur during evaluation setup or execution.
             # These are returned as error results rather than raised, so the parent process
             # can decide how to handle them (e.g., return 0.0 during DSPy optimization).
-            import traceback
-
             error_msg = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
             logger.error(
                 f"Exception in eval worker for {sample_id} on {task_path}: {type(e).__name__}: {e}"
@@ -335,23 +382,13 @@ def eval_in_subprocess(
         TimeoutError: If evaluation exceeds timeout
         RuntimeError: If evaluation fails
     """
-    # Use Pool.apply() to run worker in subprocess
-    # This properly handles return values without needing Queue
-
-    # Derive stdout/stderr log file from inspect_log_dir
     os.makedirs(inspect_log_dir, exist_ok=True)
     timestamp = int(time.time() * 1000)
     std_log_file = f"{inspect_log_dir}/{sample_id}_{timestamp}_stdout.log"
 
-    # Create a single-process pool for this evaluation.
-    #
-    # Design rationale (per Claude):
-    # - Each eval runs in isolation with no state leakage
-    # - Parallelization happens at a higher level: DSPy's ThreadPoolExecutor
-    #   (default 8 threads) spawns multiple concurrent subprocesses
-    # - This bypasses inspect_ai's global lock that prevents concurrent eval_async() calls
-    # - Pool creation overhead (~6ms) is negligible vs evaluation time (5-60s)
-    # - Achieves 3-8x speedup for typical optimizations
+    # Use single-process pool for subprocess isolation (no state leakage)
+    # Parallelization happens at higher level: DSPy's ThreadPoolExecutor spawns
+    # multiple concurrent subprocesses, bypassing inspect_ai's global lock
     with mp.Pool(processes=1) as pool:
         try:
             logger.info(
@@ -374,7 +411,6 @@ def eval_in_subprocess(
                     ),
                 ),
             )
-            # Wait for result with timeout
             result_data = async_result.get(timeout=timeout)
 
             logger.info(
@@ -395,7 +431,6 @@ def eval_in_subprocess(
                 f"Subprocess failed for sample {sample_id} after {time.perf_counter() - subprocess_start:.1f}s: {e}"
             )
 
-    # Handle result based on type
     if isinstance(result_data, EvalError):
         raise RuntimeError(
             f"Evaluation failed for sample {sample_id}: {result_data.error_message}"
