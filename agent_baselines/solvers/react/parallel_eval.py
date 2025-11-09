@@ -29,8 +29,12 @@ class ModelResult:
     """Result from evaluating a single model."""
 
     eval_path: str
-    score: float
+    score: float | None  # None indicates infrastructure failure
     answer: str | None
+
+    def float_score(self) -> float:
+        """Convert score to float, using 0.0 for infrastructure failures."""
+        return 0.0 if self.score is None else self.score
 
 
 @dataclass
@@ -217,21 +221,17 @@ def _do_evaluation(
     ), f"Expected {len(model_names)} logs, got {len(logs)}"
 
     model_results = {}
-    scores = []
 
     for eval_log in logs:
         model_name = eval_log.eval.model
 
-        score_value = 0.0
+        score_value = None
         answer = None
         eval_path = eval_log.location or ""
 
-        # Use 0.0 for failures to avoid blocking optimization on bad samples
         if not eval_log.results or not eval_log.results.scores:
             error_msg = eval_log.error if eval_log.error else "No results/scores"
-            logger.error(
-                f"Eval failed for {sample_id} on {model_name}: {error_msg}. Using score 0.0"
-            )
+            logger.error(f"Eval failed for {sample_id} on {model_name}: {error_msg}")
         else:
             scorer = None
             for score in eval_log.results.scores:
@@ -243,13 +243,13 @@ def _do_evaluation(
                 available = [s.name for s in eval_log.results.scores]
                 logger.error(
                     f"Scorer '{scorer_name}' not found for {sample_id} on {model_name}. "
-                    f"Available: {available}. Using score 0.0"
+                    f"Available: {available}"
                 )
             elif metric_name not in scorer.metrics:
                 available = list(scorer.metrics.keys())
                 logger.error(
                     f"Metric '{metric_name}' not found in scorer '{scorer_name}' for {sample_id} on {model_name}. "
-                    f"Available: {available}. Using score 0.0"
+                    f"Available: {available}"
                 )
             else:
                 score_value = float(scorer.metrics[metric_name].value)
@@ -264,17 +264,20 @@ def _do_evaluation(
             score=score_value,
             answer=answer,
         )
-        scores.append(score_value)
-        print(f"Model {model_name} score: {score_value:.4f}", file=sys.stderr)
 
-    if not scores or all(s == 0.0 for s in scores):
+        score_str = f"{score_value:.4f}" if score_value is not None else "FAILED"
+        print(f"Model {model_name} score: {score_str}", file=sys.stderr)
+
+    had_legitimate_scores = any(r.score is not None for r in model_results.values())
+    if not had_legitimate_scores:
         error_msg = (
             f"All {len(model_names)} models failed for sample {sample_id} on task {task_path}. "
-            f"This likely indicates a systemic issue with the prompts or sample."
+            f"This likely indicates a systemic issue with the evaluation infrastructure."
         )
         print(f"ERROR: {error_msg}", file=sys.stderr)
         raise RuntimeError(error_msg)
 
+    scores = [r.float_score() for r in model_results.values()]
     avg_score = sum(scores) / len(scores)
     print(f"Sample {sample_id} average score: {avg_score:.4f}", file=sys.stderr)
 
@@ -288,7 +291,10 @@ def _do_evaluation(
         average_score=avg_score,
     )
 
-    summary_filename = f"{sample_id.replace('|', '_').replace('/', '_')}_summary.json"
+    # Convert sample_id to string first (some datasets use int IDs like DS-1000's `822`)
+    summary_filename = (
+        f"{str(sample_id).replace('|', '_').replace('/', '_')}_summary.json"
+    )
     summary_path = Path(inspect_log_dir) / summary_filename
     with open(summary_path, "w") as f:
         # asdict() recursively converts nested dataclasses (ModelResult)
@@ -343,8 +349,8 @@ def _run_eval_worker(args) -> EvalResult:
             # These are returned as error results rather than raised, so the parent process
             # can decide how to handle them (e.g., return 0.0 during DSPy optimization).
             error_msg = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
-            logger.error(
-                f"Exception in eval worker for {sample_id} on {task_path}: {type(e).__name__}: {e}"
+            logger.exception(
+                f"Exception in eval worker for {sample_id} on {task_path}: {type(e).__name__}:"
             )
             return EvalError(error_message=error_msg)
 
@@ -389,7 +395,11 @@ def eval_in_subprocess(
     # Use single-process pool for subprocess isolation (no state leakage)
     # Parallelization happens at higher level: DSPy's ThreadPoolExecutor spawns
     # multiple concurrent subprocesses, bypassing inspect_ai's global lock
-    with mp.Pool(processes=1) as pool:
+    #
+    # Use 'spawn' instead of 'fork' to avoid bugs when mixing multiprocessing
+    # with threading (DSPy's ThreadPoolExecutor + tqdm progress bars).
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(processes=1) as pool:
         try:
             logger.info(
                 f"Starting subprocess for sample {sample_id} on task {task_path}"

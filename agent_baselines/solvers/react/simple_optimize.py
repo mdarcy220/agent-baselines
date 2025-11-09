@@ -80,6 +80,7 @@ class OptimizerConfig:
     temperature: float
     seed: int | None = None
     minibatch_full_eval_steps: int = 5
+    num_threads: int = 8
 
 
 @dataclass
@@ -342,6 +343,7 @@ def run_optimization(
             num_candidates=optimizer_config.num_candidates,
             init_temperature=optimizer_config.temperature,
             log_dir=run_dir,
+            num_threads=optimizer_config.num_threads,
         )
         optimizer_name = "MIPROv2"
 
@@ -600,6 +602,12 @@ if __name__ == "__main__":
         help="MIPRO: Steps between full validation evals (default: 5)",
     )
     opt_group.add_argument(
+        "--num-threads",
+        type=int,
+        default=8,
+        help="Max parallel threads for optimization (default: 8 to avoid Docker/MCP contention)",
+    )
+    opt_group.add_argument(
         "--max-bootstrapped-demos",
         type=int,
         default=0,
@@ -681,6 +689,7 @@ if __name__ == "__main__":
         temperature=args.optimizer_temperature,
         seed=args.seed,
         minibatch_full_eval_steps=args.minibatch_full_eval_steps,
+        num_threads=args.num_threads,
     )
 
     run_config = RunConfig(
