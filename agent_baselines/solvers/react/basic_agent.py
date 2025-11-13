@@ -386,6 +386,9 @@ def basic_agent(
 def instantiated_basic_agent(
     max_steps: int = 10,
     model_override: str | Model | None = None,
+    system_prompt: str = DEFAULT_SYSTEM_MESSAGE,
+    continue_prompt: str = DEFAULT_CONTINUE_MESSAGE,
+    submit_name: str = DEFAULT_SUBMIT_NAME,
     **tool_options,
 ):
     """Basic ReAct agent with configurable tools.
@@ -395,6 +398,9 @@ def instantiated_basic_agent(
         model_override: Optional model override. If provided, will use this
             model instead of the default one (prefer `--model` instead of this,
             unless this agent is being used in a multi-agent system).
+        system_prompt: System prompt for the agent.
+        continue_prompt: User message to urge the model to continue when it
+            doesn't make a tool call.
         **tool_options: Tool configuration options. See ToolsetConfig in
             astabench.tools for available options (with_search_tools,
             with_stateful_python, with_report_editor, with_table_editor,
@@ -410,7 +416,8 @@ def instantiated_basic_agent(
     logger.info("Tool configuration: %s", config.pretty_format())
 
     return basic_agent(
-        init=system_message(DEFAULT_SYSTEM_MESSAGE, submit=DEFAULT_SUBMIT_NAME),
+        init=system_message(system_prompt, submit=submit_name),
+        continue_message=continue_prompt,
         tools=tools,
         tool_call_format="native",
         max_steps=max_steps,
